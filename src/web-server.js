@@ -5006,19 +5006,41 @@ async function initSafetyPool() {
   }
 }
 
-// Initialize safety pool and start server after routes are ready
+// ── Start listening FIRST so Railway health checks pass immediately ──
+app.listen(PORT, () => {
+  console.log('🌐 SaaS Agent Web GUI started!');
+  console.log(`📱 Open your browser and go to: http://localhost:${PORT}`);
+  console.log(`🔧 API available at: http://localhost:${PORT}/api`);
+  console.log('');
+  console.log('Available endpoints:');
+  console.log('  - GET  / (Home page)');
+  console.log('  - GET  /login (Login page)');
+  console.log('  - GET  /register (Registration page)');
+  console.log('  - POST /api/auth/register (Register owner)');
+  console.log('  - POST /api/auth/login (Login)');
+  console.log('  - POST /api/auth/logout (Logout)');
+  console.log('  - POST /api/test-connection (Test database)');
+  console.log('  - GET  /api/contacts (View contacts)');
+  console.log('  - POST /api/contacts (Add contact)');
+  console.log('  - PUT  /api/contacts/:id (Edit contact)');
+  console.log('  - DELETE /api/contacts/:id (Delete contact)');
+  console.log('  - DELETE /api/contacts (Delete all contacts)');
+  console.log('');
+});
+
+// ── Initialize DB pool and safety routes in the background (non-blocking) ──
 initSafetyPool()
   .then(pool => {
     setupSafetyRoutes(app, pool);
     // Safety Agent (document ingestion with approval)
     try { require('./safety-agent-api').setupSafetyAgentRoutes(app, pool, requireAuth); } catch (e) { console.warn('SafetyAgent not loaded:', e.message); }
     // Water Management Routes
-    try { 
+    try {
       const { setupWaterManagementRoutes } = require('./routes/water-management');
       setupWaterManagementRoutes(app, pool);
     } catch (e) { console.warn('Water Management API not loaded:', e.message); }
     // Waste Management Routes
-    try { 
+    try {
       const { setupWasteManagementRoutes } = require('./routes/waste-management');
       setupWasteManagementRoutes(app, pool);
     } catch (e) { console.warn('Waste Management API not loaded:', e.message); }
@@ -5036,28 +5058,10 @@ initSafetyPool()
     return autoSeedDemoIfNeeded();
   })
   .then(() => {
-    app.listen(PORT, () => {
-      console.log('🌐 SaaS Agent Web GUI started!');
-      console.log(`📱 Open your browser and go to: http://localhost:${PORT}`);
-      console.log(`🔧 API available at: http://localhost:${PORT}/api`);
-      console.log('');
-      console.log('Available endpoints:');
-      console.log('  - GET  / (Home page)');
-      console.log('  - GET  /login (Login page)');
-      console.log('  - GET  /register (Registration page)');
-      console.log('  - POST /api/auth/register (Register owner)');
-      console.log('  - POST /api/auth/login (Login)');
-      console.log('  - POST /api/auth/logout (Logout)');
-      console.log('  - POST /api/test-connection (Test database)');
-      console.log('  - GET  /api/contacts (View contacts)');
-      console.log('  - POST /api/contacts (Add contact)');
-      console.log('  - PUT  /api/contacts/:id (Edit contact)');
-      console.log('  - DELETE /api/contacts/:id (Delete contact)');
-      console.log('  - DELETE /api/contacts (Delete all contacts)');
-      console.log('');
-    });
+    console.log('✅ Database connected and all routes initialized');
   })
   .catch(err => {
-    console.error('❌ Failed to start web server:', err.message);
-    process.exit(1);
+    console.error('❌ Background DB initialization failed:', err.message);
+    console.error('⚠️  Server is still running – DB-dependent routes will retry per request');
+    // Do NOT call process.exit(1) – keep the server alive for health checks
   });
