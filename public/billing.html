@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Billing &amp; Credits • ComplytEX</title>
+  <link rel="stylesheet" href="/app.css" />
+  <style>
+    /* ─── Reset / Base ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Inter, Arial, sans-serif;
+      background: #0b1220;
+      color: #e5e7eb;
+      min-height: 100vh;
+    }
+
+    /* ─── Layout ────────────────────────────────────────────────────── */
+    .page-wrap  { max-width: 1100px; margin: 0 auto; padding: 32px 20px 80px; }
+    .page-title { font-size: 1.75rem; font-weight: 700; margin-bottom: 4px; }
+    .page-sub   { color: #9ca3af; font-size: 0.92rem; margin-bottom: 32px; }
+
+    /* ─── Section headings ──────────────────────────────────────────── */
+    .section-title {
+      font-size: 1.1rem; font-weight: 600;
+      margin-bottom: 16px; padding-bottom: 8px;
+      border-bottom: 1px solid #1e2a3a;
+    }
+
+    /* ─── Status banner ─────────────────────────────────────────────── */
+    .status-card {
+      background: #111c2e;
+      border: 1px solid #1e2a3a;
+      border-radius: 14px;
+      padding: 22px 26px;
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      margin-bottom: 36px;
+      flex-wrap: wrap;
+    }
+    .status-icon { font-size: 2.4rem; line-height: 1; flex-shrink: 0; }
+    .status-info { flex: 1; min-width: 180px; }
+    .status-info h3 { font-size: 1.05rem; font-weight: 600; }
+    .status-info p  { font-size: 0.85rem; color: #9ca3af; margin-top: 3px; }
+    .badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .badge-active   { background: #14532d; color: #4ade80; }
+    .badge-inactive { background: #3b1f07; color: #fb923c; }
+    .badge-trial    { background: #1e3a5f; color: #60a5fa; }
+    .badge-past_due { background: #4a1942; color: #f0abfc; }
+    .badge-canceled { background: #1f2937; color: #9ca3af; }
+    .credit-chip {
+      background: #1e2a3a;
+      border-radius: 12px;
+      padding: 14px 22px;
+      text-align: center;
+      min-width: 130px;
+    }
+    .credit-chip .num  { font-size: 2rem; font-weight: 800; color: #a78bfa; line-height: 1; }
+    .credit-chip .lbl  { font-size: 0.72rem; color: #9ca3af; text-transform: uppercase; letter-spacing: .07em; margin-top: 4px; }
+    .status-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+
+    /* ─── Buttons ───────────────────────────────────────────────────── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 9px 18px;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.88rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+      text-decoration: none;
+    }
+    .btn:hover   { opacity: .88; transform: translateY(-1px); }
+    .btn:active  { transform: translateY(0); }
+    .btn-primary { background: #7c3aed; color: #fff; }
+    .btn-outline { background: transparent; color: #a78bfa; border: 1.5px solid #4c1d95; }
+    .btn-ghost   { background: #1e2a3a; color: #d1d5db; }
+    .btn-sm      { padding: 6px 13px; font-size: 0.8rem; }
+
+    /* ─── Plan cards ────────────────────────────────────────────────── */
+    .plan-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 18px;
+      margin-bottom: 44px;
+    }
+    .plan-card {
+      background: #111c2e;
+      border: 1.5px solid #1e2a3a;
+      border-radius: 16px;
+      padding: 26px 24px 24px;
+      position: relative;
+      transition: border-color .2s;
+    }
+    .plan-card:hover             { border-color: #4c1d95; }
+    .plan-card.current-plan      { border-color: #7c3aed; }
+    .plan-card .recommended-tag {
+      position: absolute;
+      top: -11px; left: 50%;
+      transform: translateX(-50%);
+      background: #7c3aed;
+      color: #fff;
+      font-size: 0.68rem;
+      font-weight: 700;
+      padding: 3px 12px;
+      border-radius: 20px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .plan-name  { font-size: 1.1rem; font-weight: 700; margin-bottom: 4px; }
+    .plan-price { font-size: 2.2rem; font-weight: 800; line-height: 1; margin: 10px 0 4px; }
+    .plan-price span { font-size: 1rem; font-weight: 400; color: #9ca3af; }
+    .plan-desc  { font-size: 0.82rem; color: #9ca3af; margin-bottom: 18px; }
+    .plan-features { list-style: none; margin-bottom: 22px; }
+    .plan-features li {
+      font-size: 0.84rem;
+      padding: 5px 0;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      color: #d1d5db;
+    }
+    .plan-features li .icon   { color: #4ade80; flex-shrink: 0; font-style: normal; }
+    .plan-features li .icon-x { color: #6b7280; }
+
+    /* ─── Credit packs ──────────────────────────────────────────────── */
+    .pack-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 14px;
+      margin-bottom: 44px;
+    }
+    .pack-card {
+      background: #111c2e;
+      border: 1.5px solid #1e2a3a;
+      border-radius: 14px;
+      padding: 20px 18px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+    }
+    .pack-card:hover   { border-color: #7c3aed; background: #16243a; }
+    .pack-credits      { font-size: 1.9rem; font-weight: 800; color: #a78bfa; }
+    .pack-label        { font-size: 0.78rem; color: #9ca3af; margin: 4px 0 10px; text-transform: uppercase; letter-spacing: .05em; }
+    .pack-price        { font-size: 1.2rem; font-weight: 700; }
+    .pack-per          { font-size: 0.72rem; color: #9ca3af; margin-top: 2px; }
+    .pack-best         { font-size: 0.68rem; background: #14532d; color: #4ade80; padding: 2px 8px; border-radius: 10px; margin-top: 8px; display: inline-block; font-weight: 700; }
+
+    /* ─── Invoice table ─────────────────────────────────────────────── */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    thead th {
+      text-align: left; padding: 10px 14px; color: #9ca3af;
+      font-weight: 600; border-bottom: 1px solid #1e2a3a; white-space: nowrap;
+    }
+    tbody td { padding: 12px 14px; border-bottom: 1px solid #1a2535; }
+    tbody tr:last-child td { border-bottom: none; }
+    .inv-status { padding: 2px 9px; border-radius: 20px; font-size: 0.72rem; font-weight: 700; }
+    .inv-paid   { background: #14532d; color: #4ade80; }
+    .inv-open   { background: #1e3a5f; color: #60a5fa; }
+    .inv-void   { background: #1f2937; color: #9ca3af; }
+
+    /* ─── Toast ─────────────────────────────────────────────────────── */
+    #toast {
+      position: fixed; bottom: 28px; right: 28px;
+      background: #1e2a3a; color: #e5e7eb;
+      padding: 12px 20px; border-radius: 10px; font-size: 0.88rem;
+      box-shadow: 0 8px 30px rgba(0,0,0,.4); z-index: 9999;
+      opacity: 0; transform: translateY(10px);
+      transition: opacity .3s, transform .3s;
+      pointer-events: none; max-width: 340px;
+    }
+    #toast.show { opacity: 1; transform: translateY(0); }
+    #toast.err  { border-left: 3px solid #f87171; }
+    #toast.ok   { border-left: 3px solid #4ade80; }
+
+    /* ─── Loading spinner ───────────────────────────────────────────── */
+    .spinner {
+      width: 18px; height: 18px;
+      border: 2px solid rgba(255,255,255,.25);
+      border-top-color: #a78bfa;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      display: inline-block; vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ─── Empty state ───────────────────────────────────────────────── */
+    .empty { text-align: center; color: #6b7280; padding: 36px 0; font-size: 0.9rem; }
+
+    /* ─── Sandbox notice ────────────────────────────────────────────── */
+    .sandbox-notice {
+      background: #1c2030; border: 1px dashed #4c1d95; border-radius: 10px;
+      padding: 14px 18px; font-size: 0.83rem; color: #a78bfa;
+      margin-bottom: 30px; display: flex; align-items: center; gap: 10px;
+    }
+  </style>
+</head>
+<body>
+<div class="page-wrap">
+
+  <!-- Header -->
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:12px;">
+    <div>
+      <h1 class="page-title">💳 Billing &amp; Credits</h1>
+      <p class="page-sub">Manage your subscription plan and AI credit balance.</p>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <button class="btn btn-outline" onclick="openPortal()">⚙️ Manage Subscription</button>
+      <button class="btn btn-ghost btn-sm" onclick="window.location='/dashboard'">← Dashboard</button>
+    </div>
+  </div>
+
+  <!-- Sandbox notice (hidden in prod via JS) -->
+  <div class="sandbox-notice" id="sandboxNotice" style="display:none;">
+    🧪 <strong>Sandbox mode:</strong>&nbsp; Use test card &nbsp;<code style="background:#1e2a3a;padding:2px 6px;border-radius:4px;font-family:monospace">4242 4242 4242 4242</code>&nbsp; · Any future exp · Any CVC
+  </div>
+
+  <!-- Current status -->
+  <div class="status-card" id="statusCard">
+    <div class="status-icon" id="statusIcon">⏳</div>
+    <div class="status-info">
+      <h3 id="statusTitle">Loading…</h3>
+      <p  id="statusDetail"></p>
+    </div>
+    <div class="credit-chip">
+      <div class="num" id="creditBal">–</div>
+      <div class="lbl">Credits</div>
+    </div>
+    <div class="status-actions" id="statusActions"></div>
+  </div>
+
+  <!-- Subscription Plans -->
+  <h2 class="section-title">📦 Subscription Plans</h2>
+  <div class="plan-grid">
+
+    <!-- Basic -->
+    <div class="plan-card" id="card-basic">
+      <div class="plan-name">Basic</div>
+      <div class="plan-price">$29<span>/mo</span></div>
+      <p class="plan-desc">For small teams getting started with compliance.</p>
+      <ul class="plan-features">
+        <li><i class="icon">✓</i> Up to 10 users</li>
+        <li><i class="icon">✓</i> Safety audits &amp; checklists</li>
+        <li><i class="icon">✓</i> Incident management</li>
+        <li><i class="icon">✓</i> 50 AI credits / month</li>
+        <li><i class="icon icon-x">✗</i> <span style="color:#6b7280">CRM module</span></li>
+        <li><i class="icon icon-x">✗</i> <span style="color:#6b7280">Asset accounting</span></li>
+      </ul>
+      <button class="btn btn-outline" style="width:100%" onclick="subscribe('basic')" id="btn-basic">Get Basic</button>
+    </div>
+
+    <!-- Pro (recommended) -->
+    <div class="plan-card" id="card-pro">
+      <div class="recommended-tag">⭐ Most Popular</div>
+      <div class="plan-name">Professional</div>
+      <div class="plan-price">$79<span>/mo</span></div>
+      <p class="plan-desc">Full feature access for growing organisations.</p>
+      <ul class="plan-features">
+        <li><i class="icon">✓</i> Unlimited users</li>
+        <li><i class="icon">✓</i> All Basic features</li>
+        <li><i class="icon">✓</i> CRM + Asset accounting</li>
+        <li><i class="icon">✓</i> Water &amp; Waste management</li>
+        <li><i class="icon">✓</i> 200 AI credits / month</li>
+        <li><i class="icon">✓</i> Priority support</li>
+      </ul>
+      <button class="btn btn-primary" style="width:100%" onclick="subscribe('pro')" id="btn-pro">Get Professional</button>
+    </div>
+
+    <!-- Enterprise -->
+    <div class="plan-card" id="card-enterprise">
+      <div class="plan-name">Enterprise</div>
+      <div class="plan-price">$199<span>/mo</span></div>
+      <p class="plan-desc">Advanced controls for large enterprises.</p>
+      <ul class="plan-features">
+        <li><i class="icon">✓</i> Everything in Pro</li>
+        <li><i class="icon">✓</i> Dedicated account manager</li>
+        <li><i class="icon">✓</i> Custom branding</li>
+        <li><i class="icon">✓</i> SSO / SAML</li>
+        <li><i class="icon">✓</i> 1 000 AI credits / month</li>
+        <li><i class="icon">✓</i> SLA guarantee</li>
+      </ul>
+      <button class="btn btn-outline" style="width:100%" onclick="subscribe('enterprise')" id="btn-enterprise">Get Enterprise</button>
+    </div>
+
+  </div>
+
+  <!-- Credit Top-Up -->
+  <h2 class="section-title">⚡ Buy AI Credits</h2>
+  <p style="font-size:.85rem;color:#9ca3af;margin-bottom:16px;">
+    Credits power AI suggestions, automated reports, and smart checklists.
+    They never expire and stack on top of your monthly allowance.
+  </p>
+  <div class="pack-grid">
+    <div class="pack-card" onclick="topup('pack_100')">
+      <div class="pack-credits">100</div>
+      <div class="pack-label">Credits</div>
+      <div class="pack-price">$10</div>
+      <div class="pack-per">$0.10 / credit</div>
+    </div>
+    <div class="pack-card" onclick="topup('pack_300')">
+      <div class="pack-credits">300</div>
+      <div class="pack-label">Credits</div>
+      <div class="pack-price">$25</div>
+      <div class="pack-per">$0.083 / credit</div>
+    </div>
+    <div class="pack-card" onclick="topup('pack_700')">
+      <div class="pack-credits">700</div>
+      <div class="pack-label">Credits</div>
+      <div class="pack-price">$50</div>
+      <div class="pack-per">$0.071 / credit</div>
+      <div class="pack-best">Best Value</div>
+    </div>
+    <div class="pack-card" onclick="topup('pack_1500')">
+      <div class="pack-credits">1,500</div>
+      <div class="pack-label">Credits</div>
+      <div class="pack-price">$100</div>
+      <div class="pack-per">$0.067 / credit</div>
+      <div class="pack-best">Best Value</div>
+    </div>
+  </div>
+
+  <!-- Invoice History -->
+  <h2 class="section-title">🧾 Invoice History</h2>
+  <div class="table-wrap" id="invoiceWrap">
+    <div class="empty"><span class="spinner"></span></div>
+  </div>
+
+</div><!-- /page-wrap -->
+<div id="toast"></div>
+
+<script>
+/* ── Helpers ──────────────────────────────────────────────────────── */
+function toast(msg, type = 'ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = `show ${type}`;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = ''; }, 4000);
+}
+function setLoading(btnId, loading) {
+  const b = document.getElementById(btnId);
+  if (!b) return;
+  if (loading) { b._orig = b.innerHTML; b.innerHTML = '<span class="spinner"></span> Redirecting…'; b.disabled = true; }
+  else { b.innerHTML = b._orig || b.innerHTML; b.disabled = false; }
+}
+
+/* ── Subscription status ─────────────────────────────────────────── */
+async function loadStatus() {
+  try {
+    const r = await fetch('/api/billing/status');
+    const d = await r.json();
+    renderStatus(d.success ? d.data : null);
+  } catch { renderStatus(null); }
+}
+function renderStatus(sub) {
+  const statusMap = {
+    active:   { icon:'✅', badge:'active'   },
+    trialing: { icon:'🆓', badge:'trial'    },
+    past_due: { icon:'⚠️', badge:'past_due' },
+    canceled: { icon:'❌', badge:'canceled' },
+    inactive: { icon:'🔒', badge:'inactive' },
+    none:     { icon:'🔒', badge:'inactive' },
+  };
+  const icon   = document.getElementById('statusIcon');
+  const title  = document.getElementById('statusTitle');
+  const detail = document.getElementById('statusDetail');
+  const bal    = document.getElementById('creditBal');
+  const acts   = document.getElementById('statusActions');
+
+  if (!sub || sub.Status === 'none') {
+    icon.textContent  = '🔒';
+    title.innerHTML   = 'No active subscription';
+    detail.textContent= 'Choose a plan below to get started.';
+    bal.textContent   = '0';
+    acts.innerHTML    = '';
+    return;
+  }
+  const s    = statusMap[sub.Status] || statusMap['inactive'];
+  const plan = sub.PlanName ? sub.PlanName.charAt(0).toUpperCase() + sub.PlanName.slice(1) : 'Unknown';
+  icon.textContent = s.icon;
+  title.innerHTML  = `${plan} Plan &nbsp;<span class="badge badge-${s.badge}">${sub.Status}</span>`;
+  bal.textContent  = (sub.CreditBalance || 0).toLocaleString();
+
+  if (sub.CurrentPeriodEnd) {
+    const exp = new Date(sub.CurrentPeriodEnd);
+    detail.textContent = `${sub.CancelAtPeriodEnd ? 'Cancels' : 'Renews'} ${exp.toLocaleDateString('en-US',{day:'numeric',month:'short',year:'numeric'})}`;
+  }
+
+  // Highlight active plan card
+  document.querySelectorAll('.plan-card').forEach(c => c.classList.remove('current-plan'));
+  const card = document.getElementById(`card-${(sub.PlanName||'').toLowerCase()}`);
+  if (card) card.classList.add('current-plan');
+
+  acts.innerHTML = '';
+  if (['active','trialing','past_due'].includes(sub.Status)) {
+    const mb = document.createElement('button');
+    mb.className = 'btn btn-ghost btn-sm';
+    mb.textContent = '⚙️ Manage / Cancel';
+    mb.onclick = openPortal;
+    acts.appendChild(mb);
+  }
+}
+
+/* ── Subscribe ───────────────────────────────────────────────────── */
+async function subscribe(plan) {
+  setLoading(`btn-${plan}`, true);
+  try {
+    const r = await fetch('/api/billing/subscribe', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ plan }),
+    });
+    const d = await r.json();
+    if (d.success && d.data?.url) { window.location.href = d.data.url; }
+    else { toast(d.error || 'Could not start checkout', 'err'); setLoading(`btn-${plan}`, false); }
+  } catch { toast('Network error', 'err'); setLoading(`btn-${plan}`, false); }
+}
+
+/* ── Credit top-up ───────────────────────────────────────────────── */
+async function topup(pack) {
+  toast('Opening checkout…');
+  try {
+    const r = await fetch('/api/billing/topup', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ pack }),
+    });
+    const d = await r.json();
+    if (d.success && d.data?.url) { window.location.href = d.data.url; }
+    else toast(d.error || 'Could not start checkout', 'err');
+  } catch { toast('Network error', 'err'); }
+}
+
+/* ── Stripe Customer Portal ──────────────────────────────────────── */
+async function openPortal() {
+  try {
+    const r = await fetch('/api/billing/portal', { method:'POST' });
+    const d = await r.json();
+    if (d.success && d.data?.url) window.location.href = d.data.url;
+    else toast(d.error || 'Portal unavailable – no active subscription found', 'err');
+  } catch { toast('Network error', 'err'); }
+}
+
+/* ── Invoice history ─────────────────────────────────────────────── */
+async function loadInvoices() {
+  const wrap = document.getElementById('invoiceWrap');
+  try {
+    const r = await fetch('/api/billing/invoices');
+    const d = await r.json();
+    if (!d.success || !d.data.length) { wrap.innerHTML = '<p class="empty">No invoices yet.</p>'; return; }
+    const rows = d.data.map(inv => {
+      const date = new Date(inv.date * 1000).toLocaleDateString('en-US',{day:'numeric',month:'short',year:'numeric'});
+      const amt  = (inv.amountCents/100).toLocaleString('en-US',{style:'currency',currency:inv.currency.toUpperCase()});
+      const sc   = ({paid:'inv-paid',open:'inv-open',void:'inv-void'})[inv.status]||'inv-open';
+      const pdf  = inv.pdf        ? `<a href="${inv.pdf}"        target="_blank" class="btn btn-ghost  btn-sm">PDF</a>`  : '';
+      const view = inv.hostedUrl  ? `<a href="${inv.hostedUrl}"  target="_blank" class="btn btn-outline btn-sm">View</a>` : '';
+      return `<tr><td>${inv.number||inv.id}</td><td>${date}</td><td>${amt}</td>
+              <td><span class="inv-status ${sc}">${inv.status}</span></td>
+              <td style="display:flex;gap:6px;">${pdf}${view}</td></tr>`;
+    }).join('');
+    wrap.innerHTML = `<table><thead><tr><th>Invoice #</th><th>Date</th><th>Amount</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch { wrap.innerHTML = '<p class="empty">Could not load invoices.</p>'; }
+}
+
+/* ── Post-checkout return handling ───────────────────────────────── */
+function handleReturn() {
+  const p = new URLSearchParams(location.search);
+  if (p.get('session_id')) {
+    toast('✅ Payment successful! Your account has been updated.', 'ok');
+    history.replaceState({}, '', '/billing');
+    setTimeout(loadStatus, 1500);   // re-fetch after webhook may have fired
+  }
+}
+
+/* ── Sandbox notice ──────────────────────────────────────────────── */
+function initSandboxNotice() {
+  if (['localhost','127.0.0.1'].includes(location.hostname))
+    document.getElementById('sandboxNotice').style.display = 'flex';
+}
+
+/* ── Boot ────────────────────────────────────────────────────────── */
+initSandboxNotice();
+handleReturn();
+loadStatus();
+loadInvoices();
+</script>
+</body>
+</html>
