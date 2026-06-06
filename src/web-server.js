@@ -1250,6 +1250,11 @@ app.post('/api/auth/verify-2fa', async (req, res) => {
   }
 });
 
+// Health check for Railway / load balancers
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+});
+
 // Demo contacts endpoints (unchanged)
 app.get('/api/contacts', requireAuth, async (req, res) => {
   try {
