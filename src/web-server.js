@@ -23,6 +23,7 @@ const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
 const { agentModules } = require('./agents-config');
 const { buildAgentGraph, createCrmContactFromText } = require('./multi-agent');
+const supabaseAuth = require('./db/supabase-auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -56,6 +57,11 @@ const stripe = process.env.STRIPE_SECRET ? new Stripe(process.env.STRIPE_SECRET)
 // ENABLE_TOTP_2FA=0  -> disable TOTP (Google Authenticator) even if user has it enabled
 const ENABLE_EMAIL_OTP = process.env.ENABLE_EMAIL_OTP === '1';
 const ENABLE_TOTP_2FA = process.env.ENABLE_TOTP_2FA !== '0';
+const ENABLE_SUPABASE_AUTH = process.env.ENABLE_SUPABASE_AUTH === '1';
+
+async function safeDisconnect(connector) {
+  try { await connector.disconnect(); } catch {}
+}
 
 // Middleware
 app.use(cors());
@@ -110,12 +116,17 @@ async function requireMembership(req, res, next) {
   const tenantId = parseInt(req.params.tenantId || req.auth?.tid);
   if (!tenantId) return res.status(400).json({ success: false, error: 'tenantId required' });
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    const q = `SELECT 1 AS ok FROM dbo.CompanyUsers WHERE TenantId=@tid AND UserId=@uid`;
-    const r = await connector.pool.request().input('tid', tenantId).input('uid', req.auth.uid).query(q);
-    await connector.disconnect();
-    if (r.recordset.length === 0) return res.status(403).json({ success: false, error: 'forbidden' });
+    if (ENABLE_SUPABASE_AUTH) {
+      const ok = await supabaseAuth.isMember(tenantId, req.auth.uid);
+      if (!ok) return res.status(403).json({ success: false, error: 'forbidden' });
+    } else {
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+      const q = `SELECT 1 AS ok FROM dbo.CompanyUsers WHERE TenantId=@tid AND UserId=@uid`;
+      const r = await connector.pool.request().input('tid', tenantId).input('uid', req.auth.uid).query(q);
+      await safeDisconnect(connector);
+      if (r.recordset.length === 0) return res.status(403).json({ success: false, error: 'forbidden' });
+    }
     req.auth.tid = tenantId; // pin
     next();
   } catch (e) { return res.status(500).json({ success: false, error: e.message }); }
@@ -125,15 +136,20 @@ function requirePerm(code) {
   return async function (req, res, next) {
     if (!req.auth?.uid || !req.auth?.tid) return res.status(401).json({ success: false, error: 'unauthorized' });
     try {
-      const connector = new AzureSQLConnector();
-      await connector.connect();
-      const request = connector.pool.request();
-      request.input('tid', req.auth.tid);
-      request.input('uid', req.auth.uid);
-      request.input('code', code);
-      const result = await request.query('SELECT dbo.fn_HasPermission(@tid, @uid, @code) AS Allowed');
-      await connector.disconnect();
-      if (result.recordset[0].Allowed !== 1) return res.status(403).json({ success: false, error: 'permission denied' });
+      if (ENABLE_SUPABASE_AUTH) {
+        const allowed = await supabaseAuth.hasPermission(req.auth.tid, req.auth.uid, code);
+        if (!allowed) return res.status(403).json({ success: false, error: 'permission denied' });
+      } else {
+        const connector = new AzureSQLConnector();
+        await connector.connect();
+        const request = connector.pool.request();
+        request.input('tid', req.auth.tid);
+        request.input('uid', req.auth.uid);
+        request.input('code', code);
+        const result = await request.query('SELECT dbo.fn_HasPermission(@tid, @uid, @code) AS Allowed');
+        await safeDisconnect(connector);
+        if (result.recordset[0].Allowed !== 1) return res.status(403).json({ success: false, error: 'permission denied' });
+      }
       next();
     } catch (e) { return res.status(500).json({ success: false, error: e.message }); }
   };
@@ -145,12 +161,18 @@ async function determineRedirect(connectorOrNull, uid, tid){
   let created = false;
   try{
     if(!tid) return '/dashboard';
-    // If no connector or the connector has not been connected yet, create+connect our own
-    if(!connector || !connector.pool){ connector = new AzureSQLConnector(); await connector.connect(); created = true; }
-    const r = await connector.pool.request()
-      .input('uid', uid).input('tid', tid)
-      .query('SELECT r.Name FROM dbo.UserRoles ur JOIN dbo.Roles r ON r.RoleId=ur.RoleId WHERE ur.UserId=@uid AND ur.TenantId=@tid');
-    const names = r.recordset.map(x=> (x.Name||'').toLowerCase());
+    let names = [];
+    if (ENABLE_SUPABASE_AUTH) {
+      const rows = await supabaseAuth.getUserRoleNames(uid, tid);
+      names = rows.map(x => (x || '').toLowerCase());
+    } else {
+      // If no connector or the connector has not been connected yet, create+connect our own
+      if(!connector || !connector.pool){ connector = new AzureSQLConnector(); await connector.connect(); created = true; }
+      const r = await connector.pool.request()
+        .input('uid', uid).input('tid', tid)
+        .query('SELECT r.Name FROM dbo.UserRoles ur JOIN dbo.Roles r ON r.RoleId=ur.RoleId WHERE ur.UserId=@uid AND ur.TenantId=@tid');
+      names = r.recordset.map(x=> (x.Name||'').toLowerCase());
+    }
     const map = [
       ['safety officer','/masters/safety-office.html'],
       ['safety office','/masters/safety-office.html'],
@@ -161,11 +183,11 @@ async function determineRedirect(connectorOrNull, uid, tid){
       ['supplier','/masters/supplier.html'],
       ['designer','/masters/designer.html'],
     ];
-    for(const [needle, path] of map){ if(names.includes(needle)) { if(created) await connector.disconnect(); return path; } }
-    if(created) await connector.disconnect();
+    for(const [needle, path] of map){ if(names.includes(needle)) { if(created) await safeDisconnect(connector); return path; } }
+    if(created) await safeDisconnect(connector);
     return '/dashboard';
   }catch{
-    try{ if(created && connector) await connector.disconnect(); }catch{}
+    try{ if(created && connector) await safeDisconnect(connector); }catch{}
     return '/dashboard';
   }
 }
@@ -280,6 +302,90 @@ app.get('/profile.htm', (req, res) => {
 // Tracking middleware for API
 app.use('/api', async (req, _res, next) => {
   try {
+    if (ENABLE_SUPABASE_AUTH) {
+      let user = await supabaseAuth.getUserByEmailForLogin(email);
+      if (!user) {
+        // Demo auto-provision remains SQL Server-only at this stage
+        return res.status(401).json({ success: false, error: 'Invalid credentials' });
+      }
+
+      if (!user.IsActive) {
+        return res.status(403).json({ success: false, error: 'Account disabled' });
+      }
+
+      const ok = verifyPassword(password, user.PasswordHash, user.PasswordSalt);
+      if (!ok) {
+        return res.status(401).json({ success: false, error: 'Invalid credentials' });
+      }
+
+      if (ENABLE_TOTP_2FA) {
+        try {
+          const row2 = await supabaseAuth.getUserTwoFactor(user.UserId);
+          if (row2 && (row2.Enabled === 1 || row2.Enabled === true)) {
+            return res.json({
+              success: true,
+              data: {
+                twoFactorRequired: true,
+                method: 'totp',
+                message: 'Enter the 6-digit code from your authenticator app to complete sign in.'
+              }
+            });
+          }
+        } catch (e) {
+          console.error('❌ 2FA check failed:', e.message);
+        }
+      }
+
+      if (transporter && ENABLE_EMAIL_OTP) {
+        const otpCode = (Math.floor(100000 + Math.random() * 900000)).toString();
+        const exp = new Date(Date.now() + 10 * 60 * 1000);
+
+        try {
+          await supabaseAuth.insertLoginOtp(user.UserId, otpCode, exp);
+        } catch (e) {
+          console.error('❌ Failed to persist login OTP:', e.message);
+          return res.status(500).json({ success: false, error: 'Unable to start two-step verification. Please try again.' });
+        }
+
+        try {
+          const mailOptions = {
+            to: user.Email,
+            bcc: 'Umair@arshco.com',
+            from: process.env.SMTP_FROM || 'noreply@complytex.com',
+            subject: 'Your ComplytEX login verification code',
+            text: `Dear ${user.FullName || 'user'},\n\nYour ComplytEX login verification code is: ${otpCode}.\nThis code will expire in 10 minutes. If you did not attempt to sign in, you can ignore this email.`,
+            html: `<p>Dear ${user.FullName || 'user'},</p>
+                 <p>Your ComplytEX login verification code is:</p>
+                 <p style=\"font-size:24px;font-weight:bold;letter-spacing:3px;\">${otpCode}</p>
+                 <p>This code will expire in 10 minutes. If you did not attempt to sign in, you can ignore this email.</p>`
+          };
+          await transporter.sendMail(mailOptions);
+        } catch (e) {
+          console.error('❌ Failed to send login verification email:', e.message);
+          return res.status(500).json({ success: false, error: 'Unable to send verification code. Please try again later.' });
+        }
+
+        return res.json({
+          success: true,
+          data: {
+            twoFactorRequired: true,
+            method: 'email',
+            message: 'A verification code has been sent to your email. Please enter it to complete sign in.'
+          }
+        });
+      }
+
+      const tenants = await supabaseAuth.getUserTenants(user.UserId);
+      const firstTenantId = tenants[0]?.TenantId || null;
+      const token = signToken({ uid: user.UserId, tid: firstTenantId });
+      res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+
+      let redirect = '/dashboard';
+      try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
+
+      return res.json({ success: true, data: { userId: user.UserId, email: user.Email, fullName: user.FullName, tenants, tenantId: firstTenantId, redirect } });
+    }
+
     const connector = new AzureSQLConnector();
     await connector.connect();
     const request = connector.pool.request();
@@ -484,58 +590,88 @@ app.post('/api/auth/register', async (req, res) => {
   } catch (e) { /* ignore if not configured */ }
 
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-
     // Hash password on server side
     const { hash, salt } = hashPassword(password);
+    let ids = null;
 
-    // Execute registration stored procedure
-    const request = connector.pool.request();
-    request.input('Email', finalEmail);
-    request.input('FullName', finalFullName);
-    request.input('PasswordHash', hash);
-    request.input('PasswordSalt', salt);
-    request.input('BusinessTypeCode', finalBusinessType);
-    request.input('TenantName', finalTenantName);
+    if (ENABLE_SUPABASE_AUTH) {
+      ids = await supabaseAuth.registerOwner({
+        email: finalEmail,
+        fullName: finalFullName,
+        passwordHash: hash,
+        passwordSalt: salt,
+        businessTypeCode: finalBusinessType,
+        tenantName: finalTenantName,
+      });
 
-    const result = await request.execute('sp_RegisterOwner');
-    
-    // Store additional user information in a separate table if needed
-    const userId = result.recordset?.[0]?.UserId;
-    if (userId && (firstName || lastName || country || cellPhone || companyPhone || designation)) {
-      try {
-        // Update user with additional information if tables support it
-        const updateRequest = connector.pool.request();
-        updateRequest.input('UserId', userId);
-        
-        const updates = [];
-        if (country) { updateRequest.input('Country', country); updates.push('Country = @Country'); }
-        if (cellPhone) { updateRequest.input('CellPhone', cellPhone); updates.push('CellPhone = @CellPhone'); }
-        if (companyPhone) { updateRequest.input('CompanyPhone', companyPhone); updates.push('CompanyPhone = @CompanyPhone'); }
-        if (designation) { updateRequest.input('Designation', designation); updates.push('Designation = @Designation'); }
-        
-        if (updates.length > 0) {
-          await updateRequest.query(`UPDATE dbo.Users SET ${updates.join(', ')} WHERE UserId = @UserId`);
+      const userId = ids?.UserId;
+      if (userId && (cellPhone || designation)) {
+        try {
+          await supabaseAuth.updateUserExtras(userId, { cellPhone, designation });
+        } catch (updateError) {
+          console.warn('⚠️ Could not save additional user information:', updateError.message);
         }
-      } catch (updateError) {
-        console.warn('⚠️ Could not save additional user information:', updateError.message);
-        // Don't fail registration if additional info can't be saved
       }
+    } else {
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+
+      // Execute registration stored procedure
+      const request = connector.pool.request();
+      request.input('Email', finalEmail);
+      request.input('FullName', finalFullName);
+      request.input('PasswordHash', hash);
+      request.input('PasswordSalt', salt);
+      request.input('BusinessTypeCode', finalBusinessType);
+      request.input('TenantName', finalTenantName);
+
+      const result = await request.execute('sp_RegisterOwner');
+      ids = result.recordset?.[0];
+
+      // Store additional user information in a separate table if needed
+      const userId = ids?.UserId;
+      if (userId && (firstName || lastName || country || cellPhone || companyPhone || designation)) {
+        try {
+          // Update user with additional information if tables support it
+          const updateRequest = connector.pool.request();
+          updateRequest.input('UserId', userId);
+
+          const updates = [];
+          if (country) { updateRequest.input('Country', country); updates.push('Country = @Country'); }
+          if (cellPhone) { updateRequest.input('CellPhone', cellPhone); updates.push('CellPhone = @CellPhone'); }
+          if (companyPhone) { updateRequest.input('CompanyPhone', companyPhone); updates.push('CompanyPhone = @CompanyPhone'); }
+          if (designation) { updateRequest.input('Designation', designation); updates.push('Designation = @Designation'); }
+
+          if (updates.length > 0) {
+            await updateRequest.query(`UPDATE dbo.Users SET ${updates.join(', ')} WHERE UserId = @UserId`);
+          }
+        } catch (updateError) {
+          console.warn('⚠️ Could not save additional user information:', updateError.message);
+          // Don't fail registration if additional info can't be saved
+        }
+      }
+
+      await safeDisconnect(connector);
     }
 
     // email verification token
     const token = crypto.randomBytes(24).toString('hex');
     const exp = new Date(Date.now() + 1000 * 60 * 60 * 24);
-    const ids = result.recordset?.[0];
     let emailSent = false;
     
     if (ids?.UserId) {
-      await connector.pool.request()
-        .input('uid', ids.UserId)
-        .input('token', token)
-        .input('exp', exp)
-        .query('INSERT INTO dbo.EmailVerifications(UserId, Token, ExpiresAt) VALUES(@uid,@token,@exp)');
+      if (ENABLE_SUPABASE_AUTH) {
+        await supabaseAuth.insertEmailVerification(ids.UserId, token, exp);
+      } else {
+        const connector = new AzureSQLConnector();
+        await connector.connect();
+        await connector.pool.request()
+          .input('uid', ids.UserId)
+          .input('token', token)
+          .input('exp', exp)
+          .query('INSERT INTO dbo.EmailVerifications(UserId, Token, ExpiresAt) VALUES(@uid,@token,@exp)');
+        await safeDisconnect(connector);
+      }
       
       if (transporter) {
         try {
@@ -557,15 +693,20 @@ app.post('/api/auth/register', async (req, res) => {
         console.log('📧 Verification URL (for testing):', `${req.protocol}://${req.get('host')}/api/auth/verify-email?token=${encodeURIComponent(token)}`);
         
         // Auto-verify user since we can't send email
-        await connector.pool.request().input('uid', ids.UserId).query('UPDATE dbo.Users SET EmailVerified=1 WHERE UserId=@uid');
+        if (ENABLE_SUPABASE_AUTH) {
+          await supabaseAuth.verifyUserEmailByUserId(ids.UserId);
+        } else {
+          const connector = new AzureSQLConnector();
+          await connector.connect();
+          await connector.pool.request().input('uid', ids.UserId).query('UPDATE dbo.Users SET EmailVerified=1 WHERE UserId=@uid');
+          await safeDisconnect(connector);
+        }
         console.log('✅ User auto-verified due to missing SMTP configuration');
       }
     }
 
-    await connector.disconnect();
-
     // Send appropriate response based on email status
-    const responseData = result.recordset?.[0] || { message: 'Registered' };
+    const responseData = ids || { message: 'Registered' };
     if (transporter) {
       responseData.message = emailSent ? 
         'Account created successfully! Please check your email to verify your account.' :
@@ -629,14 +770,20 @@ app.post('/api/auth/manual-verify', async (req, res) => {
   if (!email) return res.status(400).json({ success: false, error: 'Email required' });
   
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    const result = await connector.pool.request()
-      .input('email', email)
-      .query('UPDATE dbo.Users SET EmailVerified=1 WHERE Email=@email; SELECT @@ROWCOUNT as Updated');
-    await connector.disconnect();
-    
-    if (result.recordset[0].Updated > 0) {
+    let updated = 0;
+    if (ENABLE_SUPABASE_AUTH) {
+      updated = await supabaseAuth.manualVerifyEmailByEmail(email);
+    } else {
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+      const result = await connector.pool.request()
+        .input('email', email)
+        .query('UPDATE dbo.Users SET EmailVerified=1 WHERE Email=@email; SELECT @@ROWCOUNT as Updated');
+      await safeDisconnect(connector);
+      updated = result.recordset[0].Updated;
+    }
+
+    if (updated > 0) {
       res.json({ success: true, message: `Email ${email} has been manually verified.` });
     } else {
       res.json({ success: false, error: 'User not found or already verified.' });
@@ -652,16 +799,25 @@ app.get('/api/auth/verify-email', async (req, res) => {
   const token = (req.query.token || '').toString();
   if (!token) return res.status(400).send('Invalid token');
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    const r = await connector.pool.request().input('token', token).query(`
-      SELECT TOP 1 ev.TokenId, ev.UserId, ev.ExpiresAt, ev.Used FROM dbo.EmailVerifications ev WHERE ev.Token=@token`);
-    if (r.recordset.length === 0) { await connector.disconnect(); return res.status(400).send('Invalid token'); }
-    const row = r.recordset[0];
-    if (row.Used || new Date(row.ExpiresAt) < new Date()) { await connector.disconnect(); return res.status(400).send('Token expired/used'); }
-    await connector.pool.request().input('uid', row.UserId).query('UPDATE dbo.Users SET EmailVerified=1 WHERE UserId=@uid');
-    await connector.pool.request().input('tid', row.TokenId).query('UPDATE dbo.EmailVerifications SET Used=1 WHERE TokenId=@tid');
-    await connector.disconnect();
+    let row = null;
+    if (ENABLE_SUPABASE_AUTH) {
+      row = await supabaseAuth.getEmailVerificationByToken(token);
+      if (!row) return res.status(400).send('Invalid token');
+      if (row.Used || new Date(row.ExpiresAt) < new Date()) return res.status(400).send('Token expired/used');
+      await supabaseAuth.verifyUserEmailByUserId(row.UserId);
+      await supabaseAuth.markEmailVerificationUsed(row.TokenId);
+    } else {
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+      const r = await connector.pool.request().input('token', token).query(`
+        SELECT TOP 1 ev.TokenId, ev.UserId, ev.ExpiresAt, ev.Used FROM dbo.EmailVerifications ev WHERE ev.Token=@token`);
+      if (r.recordset.length === 0) { await safeDisconnect(connector); return res.status(400).send('Invalid token'); }
+      row = r.recordset[0];
+      if (row.Used || new Date(row.ExpiresAt) < new Date()) { await safeDisconnect(connector); return res.status(400).send('Token expired/used'); }
+      await connector.pool.request().input('uid', row.UserId).query('UPDATE dbo.Users SET EmailVerified=1 WHERE UserId=@uid');
+      await connector.pool.request().input('tid', row.TokenId).query('UPDATE dbo.EmailVerifications SET Used=1 WHERE TokenId=@tid');
+      await safeDisconnect(connector);
+    }
     res.send('Email verified successfully! You can now close this window and log in.');
   } catch (e) { 
     console.error('❌ Email verification failed:', e.message);
@@ -672,11 +828,17 @@ app.get('/api/auth/verify-email', async (req, res) => {
 // Current user
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    const u = await connector.pool.request().input('uid', req.auth.uid).query('SELECT UserId, Email, FullName, IsActive FROM dbo.Users WHERE UserId=@uid');
-    await connector.disconnect();
-    res.json({ success: true, data: { user: u.recordset[0], tenantId: req.auth.tid } });
+    let user = null;
+    if (ENABLE_SUPABASE_AUTH) {
+      user = await supabaseAuth.getUserById(req.auth.uid);
+    } else {
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+      const u = await connector.pool.request().input('uid', req.auth.uid).query('SELECT UserId, Email, FullName, IsActive FROM dbo.Users WHERE UserId=@uid');
+      await safeDisconnect(connector);
+      user = u.recordset[0];
+    }
+    res.json({ success: true, data: { user, tenantId: req.auth.tid } });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
@@ -684,14 +846,20 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
 // Get current 2FA status
 app.get('/api/auth/2fa/status', requireAuth, async (req, res) => {
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    await ensureTwoFactorTable(connector);
-    const r = await connector.pool.request()
-      .input('uid', req.auth.uid)
-      .query('SELECT Enabled FROM dbo.UserTwoFactor WHERE UserId=@uid');
-    await connector.disconnect();
-    const enabled = r.recordset[0]?.Enabled === 1 || r.recordset[0]?.Enabled === true;
+    let enabled = false;
+    if (ENABLE_SUPABASE_AUTH) {
+      const row = await supabaseAuth.getUserTwoFactor(req.auth.uid);
+      enabled = row?.Enabled === true;
+    } else {
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+      await ensureTwoFactorTable(connector);
+      const r = await connector.pool.request()
+        .input('uid', req.auth.uid)
+        .query('SELECT Enabled FROM dbo.UserTwoFactor WHERE UserId=@uid');
+      await safeDisconnect(connector);
+      enabled = r.recordset[0]?.Enabled === 1 || r.recordset[0]?.Enabled === true;
+    }
     res.json({ success: true, data: { enabled } });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
@@ -701,15 +869,20 @@ app.get('/api/auth/2fa/status', requireAuth, async (req, res) => {
 // Begin 2FA setup: generate secret + QR code (data URL)
 app.post('/api/auth/2fa/setup', requireAuth, async (req, res) => {
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    await ensureTwoFactorTable(connector);
-
-    // Load user email for label
-    const u = await connector.pool.request()
-      .input('uid', req.auth.uid)
-      .query('SELECT Email, FullName FROM dbo.Users WHERE UserId=@uid');
-    const user = u.recordset[0];
+    let user = null;
+    let connector = null;
+    if (ENABLE_SUPABASE_AUTH) {
+      user = await supabaseAuth.getUserById(req.auth.uid);
+    } else {
+      connector = new AzureSQLConnector();
+      await connector.connect();
+      await ensureTwoFactorTable(connector);
+      // Load user email for label
+      const u = await connector.pool.request()
+        .input('uid', req.auth.uid)
+        .query('SELECT Email, FullName FROM dbo.Users WHERE UserId=@uid');
+      user = u.recordset[0];
+    }
     const email = user?.Email || `user-${req.auth.uid}`;
 
     const appName = process.env.APP_NAME || 'ComplytEX';
@@ -721,20 +894,24 @@ app.post('/api/auth/2fa/setup', requireAuth, async (req, res) => {
     });
 
     // Upsert secret for this user, but keep it disabled until confirmed
-    await connector.pool.request()
-      .input('uid', req.auth.uid)
-      .input('secret', secret.base32)
-      .query(`
-        MERGE dbo.UserTwoFactor AS t
-        USING (SELECT @uid AS UserId) AS s
-        ON (t.UserId = s.UserId)
-        WHEN MATCHED THEN UPDATE SET Secret=@secret, Enabled=0, LastUsedAt=NULL
-        WHEN NOT MATCHED THEN INSERT(UserId, Secret, Enabled) VALUES(@uid, @secret, 0);`);
+    if (ENABLE_SUPABASE_AUTH) {
+      await supabaseAuth.upsertUserTwoFactorSecret(req.auth.uid, secret.base32);
+    } else {
+      await connector.pool.request()
+        .input('uid', req.auth.uid)
+        .input('secret', secret.base32)
+        .query(`
+          MERGE dbo.UserTwoFactor AS t
+          USING (SELECT @uid AS UserId) AS s
+          ON (t.UserId = s.UserId)
+          WHEN MATCHED THEN UPDATE SET Secret=@secret, Enabled=0, LastUsedAt=NULL
+          WHEN NOT MATCHED THEN INSERT(UserId, Secret, Enabled) VALUES(@uid, @secret, 0);`);
+    }
 
     const otpauthUrl = secret.otpauth_url;
     const qrDataUrl = await QRCode.toDataURL(otpauthUrl);
 
-    await connector.disconnect();
+    if (connector) await safeDisconnect(connector);
     res.json({ success: true, data: { qrDataUrl, secretBase32: secret.base32 } });
   } catch (e) {
     console.error('❌ 2FA setup failed:', e.message);
@@ -750,16 +927,21 @@ app.post('/api/auth/2fa/enable', requireAuth, async (req, res) => {
   }
 
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    await ensureTwoFactorTable(connector);
-
-    const r = await connector.pool.request()
-      .input('uid', req.auth.uid)
-      .query('SELECT Secret FROM dbo.UserTwoFactor WHERE UserId=@uid');
-    const row = r.recordset[0];
+    let row = null;
+    let connector = null;
+    if (ENABLE_SUPABASE_AUTH) {
+      row = await supabaseAuth.getUserTwoFactor(req.auth.uid);
+    } else {
+      connector = new AzureSQLConnector();
+      await connector.connect();
+      await ensureTwoFactorTable(connector);
+      const r = await connector.pool.request()
+        .input('uid', req.auth.uid)
+        .query('SELECT Secret FROM dbo.UserTwoFactor WHERE UserId=@uid');
+      row = r.recordset[0];
+    }
     if (!row) {
-      await connector.disconnect();
+      if (connector) await safeDisconnect(connector);
       return res.status(400).json({ success: false, error: '2FA setup not started' });
     }
 
@@ -771,15 +953,19 @@ app.post('/api/auth/2fa/enable', requireAuth, async (req, res) => {
     });
 
     if (!isValid) {
-      await connector.disconnect();
+      if (connector) await safeDisconnect(connector);
       return res.status(400).json({ success: false, error: 'Invalid verification code' });
     }
 
-    await connector.pool.request()
-      .input('uid', req.auth.uid)
-      .query('UPDATE dbo.UserTwoFactor SET Enabled=1, LastUsedAt=GETDATE() WHERE UserId=@uid');
+    if (ENABLE_SUPABASE_AUTH) {
+      await supabaseAuth.enableUserTwoFactor(req.auth.uid);
+    } else {
+      await connector.pool.request()
+        .input('uid', req.auth.uid)
+        .query('UPDATE dbo.UserTwoFactor SET Enabled=1, LastUsedAt=GETDATE() WHERE UserId=@uid');
+    }
 
-    await connector.disconnect();
+    if (connector) await safeDisconnect(connector);
     res.json({ success: true });
   } catch (e) {
     console.error('❌ 2FA enable failed:', e.message);
@@ -795,27 +981,31 @@ app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
   }
 
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    await ensureTwoFactorTable(connector);
-
-    // Verify password
-    const u = await connector.pool.request()
-      .input('uid', req.auth.uid)
-      .query('SELECT PasswordHash, PasswordSalt FROM dbo.Users WHERE UserId=@uid');
-    const rowUser = u.recordset[0];
+    let connector = null;
+    let rowUser = null;
+    if (ENABLE_SUPABASE_AUTH) {
+      rowUser = await supabaseAuth.getUserAuthById(req.auth.uid);
+    } else {
+      connector = new AzureSQLConnector();
+      await connector.connect();
+      await ensureTwoFactorTable(connector);
+      // Verify password
+      const u = await connector.pool.request()
+        .input('uid', req.auth.uid)
+        .query('SELECT PasswordHash, PasswordSalt FROM dbo.Users WHERE UserId=@uid');
+      rowUser = u.recordset[0];
+    }
     if (!rowUser || !verifyPassword(password, rowUser.PasswordHash, rowUser.PasswordSalt)) {
-      await connector.disconnect();
+      if (connector) await safeDisconnect(connector);
       return res.status(400).json({ success: false, error: 'Current password is incorrect' });
     }
 
     // Verify TOTP
-    const r = await connector.pool.request()
-      .input('uid', req.auth.uid)
-      .query('SELECT Secret, Enabled FROM dbo.UserTwoFactor WHERE UserId=@uid');
-    const row = r.recordset[0];
+    const row = ENABLE_SUPABASE_AUTH
+      ? await supabaseAuth.getUserTwoFactor(req.auth.uid)
+      : (await connector.pool.request().input('uid', req.auth.uid).query('SELECT Secret, Enabled FROM dbo.UserTwoFactor WHERE UserId=@uid')).recordset[0];
     if (!row || !(row.Enabled === 1 || row.Enabled === true)) {
-      await connector.disconnect();
+      if (connector) await safeDisconnect(connector);
       return res.status(400).json({ success: false, error: '2FA is not enabled' });
     }
 
@@ -827,15 +1017,19 @@ app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
     });
 
     if (!isValid) {
-      await connector.disconnect();
+      if (connector) await safeDisconnect(connector);
       return res.status(400).json({ success: false, error: 'Invalid verification code' });
     }
 
-    await connector.pool.request()
-      .input('uid', req.auth.uid)
-      .query('UPDATE dbo.UserTwoFactor SET Enabled=0 WHERE UserId=@uid');
+    if (ENABLE_SUPABASE_AUTH) {
+      await supabaseAuth.disableUserTwoFactor(req.auth.uid);
+    } else {
+      await connector.pool.request()
+        .input('uid', req.auth.uid)
+        .query('UPDATE dbo.UserTwoFactor SET Enabled=0 WHERE UserId=@uid');
+    }
 
-    await connector.disconnect();
+    if (connector) await safeDisconnect(connector);
     res.json({ success: true });
   } catch (e) {
     console.error('❌ 2FA disable failed:', e.message);
@@ -846,6 +1040,94 @@ app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
 // List tenants for current user
 app.get('/api/auth/tenants', requireAuth, async (req, res) => {
   try {
+    if (ENABLE_SUPABASE_AUTH) {
+      const user = await supabaseAuth.getUserByEmailForLogin(email);
+
+      if (!user) {
+        return res.status(401).json({ success: false, error: 'Invalid verification code or email' });
+      }
+      if (!user.IsActive) {
+        return res.status(403).json({ success: false, error: 'Account disabled' });
+      }
+
+      if (ENABLE_TOTP_2FA) {
+        try {
+          const row2 = await supabaseAuth.getUserTwoFactor(user.UserId);
+
+          if (row2 && row2.Secret) {
+            const isValid = speakeasy.totp.verify({
+              secret: row2.Secret,
+              encoding: 'base32',
+              token: code.toString(),
+              window: 1,
+            });
+
+            if (!isValid) {
+              return res.status(401).json({ success: false, error: 'Invalid or expired verification code' });
+            }
+
+            try {
+              await supabaseAuth.enableUserTwoFactor(user.UserId);
+            } catch (e) {}
+
+            const tenants = await supabaseAuth.getUserTenants(user.UserId);
+            const firstTenantId = tenants[0]?.TenantId || null;
+            const token = signToken({ uid: user.UserId, tid: firstTenantId });
+            res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+
+            let redirect = '/dashboard';
+            try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
+
+            return res.json({
+              success: true,
+              data: {
+                userId: user.UserId,
+                email: user.Email,
+                fullName: user.FullName,
+                tenants,
+                tenantId: firstTenantId,
+                redirect
+              }
+            });
+          }
+        } catch (e) {
+          console.error('2FA TOTP verification failed:', e.message);
+        }
+      }
+
+      if (ENABLE_EMAIL_OTP) {
+        const otpId = await supabaseAuth.findActiveOtp(user.UserId, code.toString());
+
+        if (!otpId) {
+          return res.status(401).json({ success: false, error: 'Invalid or expired verification code' });
+        }
+
+        await supabaseAuth.consumeOtp(otpId);
+
+        const tenants = await supabaseAuth.getUserTenants(user.UserId);
+        const firstTenantId = tenants[0]?.TenantId || null;
+        const token = signToken({ uid: user.UserId, tid: firstTenantId });
+        res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+
+        let redirect = '/dashboard';
+        try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
+
+        return res.json({
+          success: true,
+          data: {
+            userId: user.UserId,
+            email: user.Email,
+            fullName: user.FullName,
+            tenants,
+            tenantId: firstTenantId,
+            redirect
+          }
+        });
+      }
+
+      return res.status(401).json({ success: false, error: 'Invalid or expired verification code' });
+    }
+
     const connector = new AzureSQLConnector();
     await connector.connect();
     const r = await connector.pool.request().input('uid', req.auth.uid).query(`
@@ -865,11 +1147,16 @@ app.post('/api/auth/switch-tenant', requireAuth, async (req, res) => {
   const { tenantId } = req.body || {};
   if (!tenantId) return res.status(400).json({ success: false, error: 'tenantId required' });
   try {
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    const r = await connector.pool.request().input('tid', parseInt(tenantId)).input('uid', req.auth.uid).query('SELECT 1 AS ok FROM dbo.CompanyUsers WHERE TenantId=@tid AND UserId=@uid');
-    await connector.disconnect();
-    if (r.recordset.length === 0) return res.status(403).json({ success: false, error: 'forbidden' });
+    if (ENABLE_SUPABASE_AUTH) {
+      const ok = await supabaseAuth.isMember(parseInt(tenantId), req.auth.uid);
+      if (!ok) return res.status(403).json({ success: false, error: 'forbidden' });
+    } else {
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+      const r = await connector.pool.request().input('tid', parseInt(tenantId)).input('uid', req.auth.uid).query('SELECT 1 AS ok FROM dbo.CompanyUsers WHERE TenantId=@tid AND UserId=@uid');
+      await safeDisconnect(connector);
+      if (r.recordset.length === 0) return res.status(403).json({ success: false, error: 'forbidden' });
+    }
     const token = signToken({ uid: req.auth.uid, tid: parseInt(tenantId) });
     res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
     res.json({ success: true });

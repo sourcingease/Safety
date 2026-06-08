@@ -16,6 +16,8 @@
     "web": "npm install && node src/web-server.js",
     "db:setup": "node src/setup-db.js",
     "water:setup": "node src/setup-water-db.js",
+    "supabase:setup": "node scripts/setup-supabase.js",
+    "supabase:migrate": "node scripts/migrate-sqlserver-to-supabase.js",
     "seed:sample": "node src/seed-sample.js",
     "lint": "echo \"No linting configured yet\"",
     "build": "echo \"No build step required for Node.js\""
@@ -30,6 +32,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@supabase/supabase-js": "^2.53.0",
     "@azure/identity": "^4.2.1",
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
@@ -38,6 +41,7 @@
     "jsonwebtoken": "^9.0.2",
     "mammoth": "^1.6.0",
     "mssql": "^12.5.0",
+    "pg": "^8.16.3",
     "multer": "^1.4.5-lts.1",
     "nodemailer": "^8.0.7",
     "path": "^0.12.7",
