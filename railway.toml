@@ -3,7 +3,7 @@ builder = "NIXPACKS"
 buildCommand = "npm install"
 
 [deploy]
-startCommand = "node src/setup-db.js && node src/web-server.js"
+startCommand = "sh -c 'node src/setup-db.js > /tmp/setup-db.log 2>&1 & node src/web-server.js'"
 healthcheckPath = "/health"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
