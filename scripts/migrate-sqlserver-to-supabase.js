@@ -158,6 +158,10 @@ async function resetIdentityIfAny(client, tableName) {
 
     const targetByNorm = new Map(targetTables.map((t) => [normalize(t), t]));
 
+    // Build the full migration plan first so we know every target table
+    // before truncating anything (tables are FK-interdependent, so a
+    // truncate-as-we-go approach risks CASCADE wiping already-loaded data).
+    const plan = [];
     for (const sourceTable of sourceTables) {
       const targetTable = targetByNorm.get(normalize(sourceTable));
       if (!targetTable) {
@@ -178,9 +182,19 @@ async function resetIdentityIfAny(client, tableName) {
         continue;
       }
 
-      console.log(`Migrating ${sourceTable} -> ${targetTable} (${colMap.length} columns)`);
+      plan.push({ sourceTable, targetTable, colMap });
+    }
 
-      await pgClient.query(`truncate table ${pgQuote(targetTable)} restart identity cascade`);
+    const allTargets = plan.map((p) => pgQuote(p.targetTable)).join(', ');
+    console.log(`Truncating ${plan.length} target tables...`);
+    await pgClient.query(`truncate table ${allTargets} restart identity cascade`);
+
+    // Disable FK/trigger enforcement for this session so insert order
+    // across interdependent tables doesn't matter; restored in finally.
+    await pgClient.query(`SET session_replication_role = 'replica'`);
+
+    for (const { sourceTable, targetTable, colMap } of plan) {
+      console.log(`Migrating ${sourceTable} -> ${targetTable} (${colMap.length} columns)`);
 
       let offset = 0;
       while (true) {
@@ -212,8 +226,13 @@ async function resetIdentityIfAny(client, tableName) {
         process.stdout.write(`  ${offset}\r`);
       }
 
-      await resetIdentityIfAny(pgClient, targetTable);
       process.stdout.write('\n');
+    }
+
+    await pgClient.query(`SET session_replication_role = 'origin'`);
+
+    for (const { targetTable } of plan) {
+      await resetIdentityIfAny(pgClient, targetTable);
     }
 
     console.log('Migration completed');
@@ -221,6 +240,9 @@ async function resetIdentityIfAny(client, tableName) {
     console.error('Migration failed:', err);
     process.exitCode = 1;
   } finally {
+    try {
+      await pgClient.query(`SET session_replication_role = 'origin'`);
+    } catch {}
     await sqlPool.close().catch(() => {});
     pgClient.release();
     await pgPool.end().catch(() => {});

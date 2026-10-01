@@ -1,6 +1,12 @@
 // Simple multi-agent runtime primitives (no LLM, just structured routing)
 
 const { AzureSQLConnector } = require('./index');
+const ENABLE_SUPABASE_CRM = process.env.ENABLE_SUPABASE_CRM === '1';
+let supabasePgPool = null;
+function getSupabasePgPool() {
+  if (!supabasePgPool) supabasePgPool = require('./db/supabase').createSupabasePgPool();
+  return supabasePgPool;
+}
 
 // ------------------------
 // Golden Rules of Accounting (data)
@@ -251,6 +257,17 @@ async function createDemoContactFallback(rawText) {
     }
   }
 
+  if (ENABLE_SUPABASE_CRM) {
+    try {
+      const p = getSupabasePgPool();
+      await p.query('insert into contact_test(name) values ($1)', [name]);
+      const countRes = await p.query('select count(*)::int as total from contact_test');
+      return { ok: true, companyName: name, total: countRes.rows[0]?.total || 0 };
+    } catch (e) {
+      return { ok: false, message: e.message || 'Failed to save contact in fallback table.' };
+    }
+  }
+
   const connector = new AzureSQLConnector();
   try {
     await connector.connect();
@@ -307,6 +324,42 @@ async function createCrmContactFromText(rawText, ctx) {
 
   const city = matchField(/city\s*[:=]\s*([^,;\n]+)/i);
   const country = matchField(/country\s*[:=]\s*([^,;\n]+)/i);
+
+  if (ENABLE_SUPABASE_CRM) {
+    try {
+      const p = getSupabasePgPool();
+      const now = new Date();
+      const insertCompany = await p.query(
+        `insert into crm_companies(tenant_id, company_name, company_details, city, country, source_of_contact, status, saved_updated_on, send_email_on_save, created_by)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id`,
+        [tenantId, companyName, text, city || null, country || null, 'Agent', 'Lead', now, false, userId || null]
+      );
+      const companyId = insertCompany.rows[0]?.id;
+
+      if (companyId && (personName || email || phone)) {
+        let firstName = null, lastName = null;
+        if (personName) {
+          const parts = personName.split(/\s+/);
+          firstName = parts[0] || null;
+          lastName = parts.slice(1).join(' ') || null;
+        }
+        await p.query(
+          `insert into crm_contact_persons(company_id, first_name, last_name, email, phone, cell_phone) values ($1,$2,$3,$4,$5,$6)`,
+          [companyId, firstName, lastName, email || null, phone || null, null]
+        );
+      }
+
+      const countRes = await p.query('select count(*)::int as total from crm_companies where tenant_id = $1', [tenantId]);
+      const total = countRes.rows[0]?.total;
+
+      return {
+        ok: true, companyName, companyId, total: total || 0,
+        email: email || null, personName: personName || null
+      };
+    } catch (e) {
+      return { ok: false, message: e.message || 'Failed to save CRM contact.' };
+    }
+  }
 
   const connector = new AzureSQLConnector();
   try {

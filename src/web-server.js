@@ -24,6 +24,10 @@ const QRCode = require('qrcode');
 const { agentModules } = require('./agents-config');
 const { buildAgentGraph, createCrmContactFromText } = require('./multi-agent');
 const supabaseAuth = require('./db/supabase-auth');
+const supabaseCrm = require('./db/supabase-crm');
+const supabaseHr = require('./db/supabase-hr');
+const supabaseAccounting = require('./db/supabase-accounting');
+const supabaseCore = require('./db/supabase-core');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -58,6 +62,11 @@ const stripe = process.env.STRIPE_SECRET ? new Stripe(process.env.STRIPE_SECRET)
 const ENABLE_EMAIL_OTP = process.env.ENABLE_EMAIL_OTP === '1';
 const ENABLE_TOTP_2FA = process.env.ENABLE_TOTP_2FA !== '0';
 const ENABLE_SUPABASE_AUTH = process.env.ENABLE_SUPABASE_AUTH === '1';
+const ENABLE_SUPABASE_CRM = process.env.ENABLE_SUPABASE_CRM === '1';
+const ENABLE_SUPABASE_HR = process.env.ENABLE_SUPABASE_HR === '1';
+const ENABLE_SUPABASE_ACCOUNTING = process.env.ENABLE_SUPABASE_ACCOUNTING === '1';
+const ENABLE_SUPABASE_CHAT = process.env.ENABLE_SUPABASE_CHAT === '1';
+const ENABLE_SUPABASE_BILLING = process.env.ENABLE_SUPABASE_BILLING === '1';
 
 async function safeDisconnect(connector) {
   try { await connector.disconnect(); } catch {}
@@ -207,8 +216,48 @@ async function ensureTwoFactorTable(connector) {
 }
 
 // Auto-seed demo users if missing (dev convenience)
+const DEMO_ROLES = [
+  ['HR Manager',['MODULE_VIEW_HR','MODULE_MANAGE_HR','USER_MANAGE']],
+  ['Sales Manager',['MODULE_VIEW_CRM','MODULE_MANAGE_CRM']],
+  ['Buyer',['MODULE_VIEW_CRM']],
+  ['Supplier',['MODULE_VIEW_SUPPLIERS']],
+  ['Designer',['MODULE_VIEW_MARKETING']],
+  ['Safety Auditor',['MODULE_VIEW_CERTIFICATION']],
+  ['Safety Office',['MODULE_VIEW_CERTIFICATION','MODULE_VIEW_HR']],
+  ['Inspection',['MODULE_VIEW_CERTIFICATION']],
+];
+const DEMO_EMPLOYEES = [
+  ['hr@demo.example','Demo HR','HR Manager','HR Manager'],
+  ['sales@demo.example','Demo Sales','Sales Manager','Sales Manager'],
+  ['buyer@demo.example','Demo Buyer','Buyer','Buyer'],
+  ['supplier@demo.example','Demo Supplier','Supplier','Supplier'],
+  ['designer@demo.example','Demo Designer','Designer','Designer'],
+  ['auditor@demo.example','Demo Safety Auditor','Safety Auditor','Safety Auditor'],
+  ['safety@demo.example','Demo Safety Office','Safety Office','Safety Office'],
+  ['inspection@demo.example','Demo Inspection','Inspection','Inspection'],
+];
+
 async function autoSeedDemoIfNeeded(){
   if(process.env.AUTO_SEED_DEMO === '0') return; // opt-out
+  if (ENABLE_SUPABASE_AUTH) {
+    try {
+      if (await supabaseCore.tenantIdByOwnerEmail('owner@demo.example')) return;
+      const crypto = require('crypto');
+      const s = crypto.randomBytes(16); const h = crypto.scryptSync('DemoPass123!', s, 64);
+      const { TenantId: tenantId } = await supabaseAuth.registerOwner({
+        email: 'owner@demo.example', fullName: 'Demo Owner', passwordHash: h, passwordSalt: s,
+        businessTypeCode: 'Manufacturer', tenantName: 'Demo Factory',
+      });
+      for (const [roleName, codes] of DEMO_ROLES) await supabaseCore.createTenantRole(tenantId, roleName, codes);
+      // Employees with default password Welcome123!
+      for (const [email, fullName, title, roleName] of DEMO_EMPLOYEES) {
+        const es = crypto.randomBytes(16); const eh = crypto.scryptSync('Welcome123!', es, 64);
+        await supabaseCore.createTenantEmployee({ tenantId, email, fullName, passwordHash: eh, passwordSalt: es, roleName, title });
+      }
+      console.log('✅ Demo tenant and accounts seeded');
+    } catch (e) { console.warn('Auto-seed skipped:', e.message); }
+    return;
+  }
   try{
     const connector = new AzureSQLConnector();
     await connector.connect();
@@ -300,106 +349,37 @@ app.get('/profile.htm', (req, res) => {
 });
 
 // Tracking middleware for API
-app.use('/api', async (req, _res, next) => {
-  try {
-    if (ENABLE_SUPABASE_AUTH) {
-      let user = await supabaseAuth.getUserByEmailForLogin(email);
-      if (!user) {
-        // Demo auto-provision remains SQL Server-only at this stage
-        return res.status(401).json({ success: false, error: 'Invalid credentials' });
+// Fire-and-forget: never await this in the request path, so a slow/unreachable
+// database never stalls the /api request itself.
+let visitorLogPgPool = null;
+app.use('/api', (req, _res, next) => {
+  (async () => {
+    try {
+      if (ENABLE_SUPABASE_AUTH) {
+        if (!visitorLogPgPool) visitorLogPgPool = require('./db/supabase').createSupabasePgPool();
+        await visitorLogPgPool.query(
+          `insert into visitor_logs(tenant_id, user_id, path, method, ip, user_agent, referrer)
+           values ($1,$2,$3,$4,$5,$6,$7)`,
+          [req.auth?.tid || null, req.auth?.uid || null, req.path, req.method, req.ip,
+           req.headers['user-agent'] || null, req.headers['referer'] || null]
+        );
+        return;
       }
-
-      if (!user.IsActive) {
-        return res.status(403).json({ success: false, error: 'Account disabled' });
-      }
-
-      const ok = verifyPassword(password, user.PasswordHash, user.PasswordSalt);
-      if (!ok) {
-        return res.status(401).json({ success: false, error: 'Invalid credentials' });
-      }
-
-      if (ENABLE_TOTP_2FA) {
-        try {
-          const row2 = await supabaseAuth.getUserTwoFactor(user.UserId);
-          if (row2 && (row2.Enabled === 1 || row2.Enabled === true)) {
-            return res.json({
-              success: true,
-              data: {
-                twoFactorRequired: true,
-                method: 'totp',
-                message: 'Enter the 6-digit code from your authenticator app to complete sign in.'
-              }
-            });
-          }
-        } catch (e) {
-          console.error('❌ 2FA check failed:', e.message);
-        }
-      }
-
-      if (transporter && ENABLE_EMAIL_OTP) {
-        const otpCode = (Math.floor(100000 + Math.random() * 900000)).toString();
-        const exp = new Date(Date.now() + 10 * 60 * 1000);
-
-        try {
-          await supabaseAuth.insertLoginOtp(user.UserId, otpCode, exp);
-        } catch (e) {
-          console.error('❌ Failed to persist login OTP:', e.message);
-          return res.status(500).json({ success: false, error: 'Unable to start two-step verification. Please try again.' });
-        }
-
-        try {
-          const mailOptions = {
-            to: user.Email,
-            bcc: 'Umair@arshco.com',
-            from: process.env.SMTP_FROM || 'noreply@complytex.com',
-            subject: 'Your ComplytEX login verification code',
-            text: `Dear ${user.FullName || 'user'},\n\nYour ComplytEX login verification code is: ${otpCode}.\nThis code will expire in 10 minutes. If you did not attempt to sign in, you can ignore this email.`,
-            html: `<p>Dear ${user.FullName || 'user'},</p>
-                 <p>Your ComplytEX login verification code is:</p>
-                 <p style=\"font-size:24px;font-weight:bold;letter-spacing:3px;\">${otpCode}</p>
-                 <p>This code will expire in 10 minutes. If you did not attempt to sign in, you can ignore this email.</p>`
-          };
-          await transporter.sendMail(mailOptions);
-        } catch (e) {
-          console.error('❌ Failed to send login verification email:', e.message);
-          return res.status(500).json({ success: false, error: 'Unable to send verification code. Please try again later.' });
-        }
-
-        return res.json({
-          success: true,
-          data: {
-            twoFactorRequired: true,
-            method: 'email',
-            message: 'A verification code has been sent to your email. Please enter it to complete sign in.'
-          }
-        });
-      }
-
-      const tenants = await supabaseAuth.getUserTenants(user.UserId);
-      const firstTenantId = tenants[0]?.TenantId || null;
-      const token = signToken({ uid: user.UserId, tid: firstTenantId });
-      res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
-
-      let redirect = '/dashboard';
-      try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
-
-      return res.json({ success: true, data: { userId: user.UserId, email: user.Email, fullName: user.FullName, tenants, tenantId: firstTenantId, redirect } });
-    }
-
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    const request = connector.pool.request();
-    request.input('TenantId', req.auth?.tid || null);
-    request.input('UserId', req.auth?.uid || null);
-    request.input('Path', req.path);
-    request.input('Method', req.method);
-    request.input('IP', req.ip);
-    request.input('UserAgent', req.headers['user-agent'] || null);
-    request.input('Referrer', req.headers['referer'] || null);
-    await request.query(`INSERT INTO dbo.VisitorLogs(TenantId, UserId, Path, Method, IP, UserAgent, Referrer)
-                         VALUES(@TenantId,@UserId,@Path,@Method,@IP,@UserAgent,@Referrer)`);
-    await connector.disconnect();
-  } catch (e) { /* ignore logging errors */ }
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+      const request = connector.pool.request();
+      request.input('TenantId', req.auth?.tid || null);
+      request.input('UserId', req.auth?.uid || null);
+      request.input('Path', req.path);
+      request.input('Method', req.method);
+      request.input('IP', req.ip);
+      request.input('UserAgent', req.headers['user-agent'] || null);
+      request.input('Referrer', req.headers['referer'] || null);
+      await request.query(`INSERT INTO dbo.VisitorLogs(TenantId, UserId, Path, Method, IP, UserAgent, Referrer)
+                           VALUES(@TenantId,@UserId,@Path,@Method,@IP,@UserAgent,@Referrer)`);
+      await connector.disconnect();
+    } catch (e) { /* ignore logging errors */ }
+  })();
   next();
 });
 
@@ -519,17 +499,34 @@ app.post('/api/agents/chat', requireAuth, async (req, res) => {
 app.post('/api/test-connection', async (req, res) => {
   try {
     console.log('🔍 Testing database connection...');
-    
+
+    if (ENABLE_SUPABASE_AUTH) {
+      const pgPool = require('./db/supabase').createSupabasePgPool();
+      const r = await pgPool.query('select now() as current_time, current_database() as db_name');
+      const tables = await pgPool.query(`select table_name from information_schema.tables where table_schema='public' and table_type='BASE TABLE' order by table_name`);
+      return res.json({
+        success: true,
+        message: 'Connection successful!',
+        data: {
+          database: r.rows[0].db_name,
+          server: (process.env.SUPABASE_URL || '').replace(/^https?:\/\//, ''),
+          connectionTime: r.rows[0].current_time,
+          tables: tables.rows.length,
+          tableNames: tables.rows.map(t => t.table_name)
+        }
+      });
+    }
+
     const connector = new AzureSQLConnector();
     await connector.connect();
-    
+
     const connectionTest = await connector.testConnection();
     const tables = await connector.getTableList();
-    
+
     const server = process.env.AZURE_SQL_SERVER || 'zlnsw9feuf.database.windows.net';
-    
+
     await connector.disconnect();
-    
+
     res.json({
       success: true,
       message: 'Connection successful!',
@@ -541,7 +538,7 @@ app.post('/api/test-connection', async (req, res) => {
         tableNames: tables.map(t => t.TABLE_NAME)
       }
     });
-    
+
   } catch (error) {
     console.error('❌ Connection test failed:', error.message);
     res.json({
@@ -1041,91 +1038,8 @@ app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
 app.get('/api/auth/tenants', requireAuth, async (req, res) => {
   try {
     if (ENABLE_SUPABASE_AUTH) {
-      const user = await supabaseAuth.getUserByEmailForLogin(email);
-
-      if (!user) {
-        return res.status(401).json({ success: false, error: 'Invalid verification code or email' });
-      }
-      if (!user.IsActive) {
-        return res.status(403).json({ success: false, error: 'Account disabled' });
-      }
-
-      if (ENABLE_TOTP_2FA) {
-        try {
-          const row2 = await supabaseAuth.getUserTwoFactor(user.UserId);
-
-          if (row2 && row2.Secret) {
-            const isValid = speakeasy.totp.verify({
-              secret: row2.Secret,
-              encoding: 'base32',
-              token: code.toString(),
-              window: 1,
-            });
-
-            if (!isValid) {
-              return res.status(401).json({ success: false, error: 'Invalid or expired verification code' });
-            }
-
-            try {
-              await supabaseAuth.enableUserTwoFactor(user.UserId);
-            } catch (e) {}
-
-            const tenants = await supabaseAuth.getUserTenants(user.UserId);
-            const firstTenantId = tenants[0]?.TenantId || null;
-            const token = signToken({ uid: user.UserId, tid: firstTenantId });
-            res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
-
-            let redirect = '/dashboard';
-            try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
-
-            return res.json({
-              success: true,
-              data: {
-                userId: user.UserId,
-                email: user.Email,
-                fullName: user.FullName,
-                tenants,
-                tenantId: firstTenantId,
-                redirect
-              }
-            });
-          }
-        } catch (e) {
-          console.error('2FA TOTP verification failed:', e.message);
-        }
-      }
-
-      if (ENABLE_EMAIL_OTP) {
-        const otpId = await supabaseAuth.findActiveOtp(user.UserId, code.toString());
-
-        if (!otpId) {
-          return res.status(401).json({ success: false, error: 'Invalid or expired verification code' });
-        }
-
-        await supabaseAuth.consumeOtp(otpId);
-
-        const tenants = await supabaseAuth.getUserTenants(user.UserId);
-        const firstTenantId = tenants[0]?.TenantId || null;
-        const token = signToken({ uid: user.UserId, tid: firstTenantId });
-        res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
-
-        let redirect = '/dashboard';
-        try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
-
-        return res.json({
-          success: true,
-          data: {
-            userId: user.UserId,
-            email: user.Email,
-            fullName: user.FullName,
-            tenants,
-            tenantId: firstTenantId,
-            redirect
-          }
-        });
-      }
-
-      return res.status(401).json({ success: false, error: 'Invalid or expired verification code' });
+      const data = await supabaseAuth.getUserTenants(req.auth.uid);
+      return res.json({ success: true, data });
     }
 
     const connector = new AzureSQLConnector();
@@ -1178,6 +1092,17 @@ async function ensureDemoUser(email){
   };
   const cfg = map[email.toLowerCase()];
   if(!cfg) return null;
+  if (ENABLE_SUPABASE_AUTH) {
+    try {
+      let tenantId = await supabaseCore.tenantIdByOwnerEmail('owner@demo.example');
+      if (!tenantId) { await autoSeedDemoIfNeeded(); tenantId = await supabaseCore.tenantIdByOwnerEmail('owner@demo.example'); }
+      if (!tenantId) return null;
+      await supabaseCore.createTenantRole(tenantId, cfg.role, []);
+      const crypto = require('crypto'); const s = crypto.randomBytes(16); const h = crypto.scryptSync('Welcome123!', s, 64);
+      await supabaseCore.createTenantEmployee({ tenantId, email, fullName: cfg.fullName, passwordHash: h, passwordSalt: s, roleName: cfg.role, title: cfg.title });
+      return true;
+    } catch (e) { return null; }
+  }
   const connector = new AzureSQLConnector(); await connector.connect();
   // Find demo tenant via owner
   let tidRes = await connector.pool.request().input('email','owner@demo.example').query(`
@@ -1218,6 +1143,86 @@ app.post('/api/auth/login', async (req, res) => {
   }
 
   try {
+    if (ENABLE_SUPABASE_AUTH) {
+      const user = await supabaseAuth.getUserByEmailForLogin(email);
+      if (!user) {
+        return res.status(401).json({ success: false, error: 'Invalid credentials' });
+      }
+      if (!user.IsActive) {
+        return res.status(403).json({ success: false, error: 'Account disabled' });
+      }
+      const ok = verifyPassword(password, user.PasswordHash, user.PasswordSalt);
+      if (!ok) {
+        return res.status(401).json({ success: false, error: 'Invalid credentials' });
+      }
+
+      if (ENABLE_TOTP_2FA) {
+        try {
+          const row2 = await supabaseAuth.getUserTwoFactor(user.UserId);
+          if (row2 && (row2.Enabled === 1 || row2.Enabled === true)) {
+            return res.json({
+              success: true,
+              data: {
+                twoFactorRequired: true,
+                method: 'totp',
+                message: 'Enter the 6-digit code from your authenticator app to complete sign in.'
+              }
+            });
+          }
+        } catch (e) {
+          console.error('❌ 2FA check failed:', e.message);
+        }
+      }
+
+      if (transporter && ENABLE_EMAIL_OTP) {
+        const otpCode = (Math.floor(100000 + Math.random() * 900000)).toString();
+        const exp = new Date(Date.now() + 10 * 60 * 1000);
+
+        try {
+          await supabaseAuth.insertLoginOtp(user.UserId, otpCode, exp);
+        } catch (e) {
+          console.error('❌ Failed to persist login OTP:', e.message);
+          return res.status(500).json({ success: false, error: 'Unable to start two-step verification. Please try again.' });
+        }
+
+        try {
+          await transporter.sendMail({
+            to: user.Email,
+            bcc: 'Umair@arshco.com',
+            from: process.env.SMTP_FROM || 'noreply@complytex.com',
+            subject: 'Your ComplytEX login verification code',
+            text: `Dear ${user.FullName || 'user'},\n\nYour ComplytEX login verification code is: ${otpCode}.\nThis code will expire in 10 minutes. If you did not attempt to sign in, you can ignore this email.`,
+            html: `<p>Dear ${user.FullName || 'user'},</p>
+                 <p>Your ComplytEX login verification code is:</p>
+                 <p style=\"font-size:24px;font-weight:bold;letter-spacing:3px;\">${otpCode}</p>
+                 <p>This code will expire in 10 minutes. If you did not attempt to sign in, you can ignore this email.</p>`
+          });
+        } catch (e) {
+          console.error('❌ Failed to send login verification email:', e.message);
+          return res.status(500).json({ success: false, error: 'Unable to send verification code. Please try again later.' });
+        }
+
+        return res.json({
+          success: true,
+          data: {
+            twoFactorRequired: true,
+            method: 'email',
+            message: 'A verification code has been sent to your email. Please enter it to complete sign in.'
+          }
+        });
+      }
+
+      const tenants = await supabaseAuth.getUserTenants(user.UserId);
+      const firstTenantId = tenants[0]?.TenantId || null;
+      const token = signToken({ uid: user.UserId, tid: firstTenantId });
+      res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+
+      let redirect = '/dashboard';
+      try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
+
+      return res.json({ success: true, data: { userId: user.UserId, email: user.Email, fullName: user.FullName, tenants, tenantId: firstTenantId, redirect } });
+    }
+
     const connector = new AzureSQLConnector();
     await connector.connect();
 
@@ -1379,6 +1384,45 @@ app.post('/api/auth/verify-2fa', async (req, res) => {
   }
 
   try {
+    if (ENABLE_SUPABASE_AUTH) {
+      const user = await supabaseAuth.getUserByEmailForLogin(email);
+      if (!user) return res.status(401).json({ success: false, error: 'Invalid verification code or email' });
+      if (!user.IsActive) return res.status(403).json({ success: false, error: 'Account disabled' });
+
+      async function finishLogin() {
+        const tenants = await supabaseAuth.getUserTenants(user.UserId);
+        const firstTenantId = tenants[0]?.TenantId || null;
+        const token = signToken({ uid: user.UserId, tid: firstTenantId });
+        res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+        let redirect = '/dashboard';
+        try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
+        return res.json({ success: true, data: { userId: user.UserId, email: user.Email, fullName: user.FullName, tenants, tenantId: firstTenantId, redirect } });
+      }
+
+      if (ENABLE_TOTP_2FA) {
+        try {
+          const row2 = await supabaseAuth.getUserTwoFactor(user.UserId);
+          if (row2 && row2.Secret) {
+            const isValid = speakeasy.totp.verify({ secret: row2.Secret, encoding: 'base32', token: code.toString(), window: 1 });
+            if (!isValid) return res.status(401).json({ success: false, error: 'Invalid or expired verification code' });
+            try { await supabaseAuth.enableUserTwoFactor(user.UserId); } catch (e) {}
+            return await finishLogin();
+          }
+        } catch (e) {
+          console.error('2FA TOTP verification failed:', e.message);
+        }
+      }
+
+      if (ENABLE_EMAIL_OTP) {
+        const otpId = await supabaseAuth.findActiveOtp(user.UserId, code.toString());
+        if (!otpId) return res.status(401).json({ success: false, error: 'Invalid or expired verification code' });
+        await supabaseAuth.consumeOtp(otpId);
+        return await finishLogin();
+      }
+
+      return res.status(401).json({ success: false, error: 'Invalid or expired verification code' });
+    }
+
     const connector = new AzureSQLConnector();
     await connector.connect();
 
@@ -1545,6 +1589,7 @@ app.get('/health', (req, res) => {
 // Demo contacts endpoints (unchanged)
 app.get('/api/contacts', requireAuth, async (req, res) => {
   try {
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getContacts(); return res.json({ success: true, data }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     
@@ -1580,20 +1625,25 @@ app.post('/api/contacts', requireAuth, async (req, res) => {
         error: 'Name is required'
       });
     }
-    
+
+    if (ENABLE_SUPABASE_CRM) {
+      const total = await supabaseCrm.createContact(name.trim());
+      return res.json({ success: true, message: `Contact "${name.trim()}" added successfully!`, totalContacts: total });
+    }
+
     const connector = new AzureSQLConnector();
     await connector.connect();
-    
+
     // Insert new contact
     const cleanName = name.trim().replace(/'/g, "''");
     const insertQuery = `INSERT INTO contactTest (Name) VALUES ('${cleanName}')`;
     await connector.executeQuery(insertQuery);
-    
+
     // Get updated count
     const countResult = await connector.executeQuery('SELECT COUNT(*) as total FROM contactTest');
-    
+
     await connector.disconnect();
-    
+
     res.json({
       success: true,
       message: `Contact "${name.trim()}" added successfully!`,
@@ -1620,17 +1670,23 @@ app.put('/api/contacts/:id', requireAuth, async (req, res) => {
         error: 'Name is required'
       });
     }
-    
+
+    if (ENABLE_SUPABASE_CRM) {
+      const rowCount = await supabaseCrm.updateContact(parseInt(id), name.trim());
+      if (rowCount > 0) return res.json({ success: true, message: `Contact "${name.trim()}" updated successfully!` });
+      return res.json({ success: false, error: 'Contact not found' });
+    }
+
     const connector = new AzureSQLConnector();
     await connector.connect();
-    
+
     // Update contact
     const cleanName = name.trim().replace(/'/g, "''");
     const updateQuery = `UPDATE contactTest SET Name = '${cleanName}' WHERE Id = ${parseInt(id)}`;
     const result = await connector.executeQuery(updateQuery);
-    
+
     await connector.disconnect();
-    
+
     if (result.rowsAffected[0] > 0) {
       res.json({
         success: true,
@@ -1655,14 +1711,20 @@ app.put('/api/contacts/:id', requireAuth, async (req, res) => {
 app.delete('/api/contacts/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    
+
+    if (ENABLE_SUPABASE_CRM) {
+      const rowCount = await supabaseCrm.deleteContact(parseInt(id));
+      if (rowCount > 0) return res.json({ success: true, message: 'Contact deleted successfully' });
+      return res.json({ success: false, error: 'Contact not found' });
+    }
+
     const connector = new AzureSQLConnector();
     await connector.connect();
-    
+
     const result = await connector.executeQuery(`DELETE FROM contactTest WHERE Id = ${parseInt(id)}`);
-    
+
     await connector.disconnect();
-    
+
     if (result.rowsAffected[0] > 0) {
       res.json({
         success: true,
@@ -1686,13 +1748,18 @@ app.delete('/api/contacts/:id', requireAuth, async (req, res) => {
 
 app.delete('/api/contacts', requireAuth, async (req, res) => {
   try {
+    if (ENABLE_SUPABASE_CRM) {
+      const rowCount = await supabaseCrm.deleteAllContacts();
+      return res.json({ success: true, message: `Deleted ${rowCount} contacts`, deletedCount: rowCount });
+    }
+
     const connector = new AzureSQLConnector();
     await connector.connect();
-    
+
     const result = await connector.executeQuery('DELETE FROM contactTest');
-    
+
     await connector.disconnect();
-    
+
     res.json({
       success: true,
       message: `Deleted ${result.rowsAffected[0]} contacts`,
@@ -1711,7 +1778,13 @@ app.delete('/api/contacts', requireAuth, async (req, res) => {
 app.get('/api/agent/status', (req, res) => {
   res.json({
     success: true,
-    data: {
+    data: ENABLE_SUPABASE_AUTH ? {
+      status: 'running',
+      database: 'Supabase Postgres',
+      server: (process.env.SUPABASE_URL || '').replace(/^https?:\/\//, ''),
+      uptime: process.uptime(),
+      version: '1.0.0'
+    } : {
       status: 'running',
       database: process.env.AZURE_SQL_DATABASE || 'SeApp2',
       server: process.env.AZURE_SQL_SERVER || 'zlnsw9feuf.database.windows.net',
@@ -1726,6 +1799,7 @@ app.get('/api/tenants/by-email', async (req, res) => {
   const email = (req.query.email || '').toString();
   if (!email) return res.status(400).json({ success: false, error: 'email required' });
   try {
+    if (ENABLE_SUPABASE_AUTH) { const data = await supabaseCore.tenantsByEmail(email); return res.json({ success: true, data }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const request = connector.pool.request();
@@ -1749,6 +1823,7 @@ app.get('/api/tenants/by-email', async (req, res) => {
 app.get('/api/tenant/:tenantId/summary', requireAuth, requireMembership, async (req, res) => {
   const { tenantId } = req.params;
   try {
+    if (ENABLE_SUPABASE_AUTH) { const data = await supabaseCore.tenantSummary(parseInt(tenantId)); return res.json({ success: true, data }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const request = connector.pool.request();
@@ -1782,6 +1857,7 @@ app.get('/api/tenant/:tenantId/summary', requireAuth, requireMembership, async (
 app.get('/api/tenant/:tenantId/employees', requireAuth, requireMembership, async (req, res) => {
   const { tenantId } = req.params;
   try {
+    if (ENABLE_SUPABASE_AUTH) { const data = await supabaseCore.tenantEmployees(parseInt(tenantId)); return res.json({ success: true, data }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const request = connector.pool.request();
@@ -1810,6 +1886,11 @@ app.post('/api/tenant/:tenantId/employees', requireAuth, requireMembership, requ
   const { email, fullName, password, roleName, title } = req.body || {};
   if (!email) return res.status(400).json({ success: false, error: 'Email required' });
   try {
+    if (ENABLE_SUPABASE_AUTH) {
+      const { hash, salt } = password ? hashPassword(password) : { hash: null, salt: null };
+      const row = await supabaseCore.createTenantEmployee({ tenantId: parseInt(tenantId), email, fullName, passwordHash: hash, passwordSalt: salt, roleName, title });
+      return res.json({ success: true, data: row });
+    }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const request = connector.pool.request();
@@ -1841,6 +1922,7 @@ app.post('/api/tenant/:tenantId/employees', requireAuth, requireMembership, requ
 app.get('/api/tenant/:tenantId/roles', requireAuth, requireMembership, async (req, res) => {
   const { tenantId } = req.params;
   try {
+    if (ENABLE_SUPABASE_AUTH) { const data = await supabaseCore.tenantRoles(parseInt(tenantId)); return res.json({ success: true, data }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const request = connector.pool.request();
@@ -1855,6 +1937,7 @@ app.get('/api/tenant/:tenantId/roles', requireAuth, requireMembership, async (re
 
 app.get('/api/permissions', requireAuth, async (_req, res) => {
   try {
+    if (ENABLE_SUPABASE_AUTH) { const data = await supabaseCore.listPermissions(); return res.json({ success: true, data }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const q = `SELECT p.PermissionId, p.Code, p.Description, m.Name AS ModuleName FROM dbo.Permissions p LEFT JOIN dbo.Modules m ON m.ModuleId = p.ModuleId ORDER BY p.Code`;
@@ -1871,6 +1954,10 @@ app.post('/api/tenant/:tenantId/roles', requireAuth, requireMembership, requireP
   const { roleName, permissionCodes } = req.body || {};
   if (!roleName) return res.status(400).json({ success: false, error: 'roleName required' });
   try {
+    if (ENABLE_SUPABASE_AUTH) {
+      const data = await supabaseCore.createTenantRole(parseInt(tenantId), roleName, permissionCodes || []);
+      return res.json({ success: true, data });
+    }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const tvp = new (require('mssql')).Table('dbo.StringList');
@@ -1894,6 +1981,10 @@ app.post('/api/tenant/:tenantId/assign-role', requireAuth, requireMembership, re
   const { userId, roleId } = req.body || {};
   if (!userId || !roleId) return res.status(400).json({ success: false, error: 'userId and roleId required' });
   try {
+    if (ENABLE_SUPABASE_AUTH) {
+      await supabaseCore.assignUserRole(parseInt(tenantId), parseInt(userId), parseInt(roleId));
+      return res.json({ success: true, data: { ok: true } });
+    }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const request = connector.pool.request();
@@ -1911,6 +2002,7 @@ app.post('/api/tenant/:tenantId/assign-role', requireAuth, requireMembership, re
 // Support Tickets
 app.get('/api/support/tickets', requireAuth, async (req, res) => {
   try {
+    if (ENABLE_SUPABASE_CHAT) { const data = await supabaseCore.listTickets({ userId: req.auth.uid, tenantId: req.auth.tid }); return res.json({ success: true, data }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const r = await connector.pool.request().input('uid', req.auth.uid).query(`
@@ -1924,6 +2016,10 @@ app.post('/api/support/tickets', requireAuth, async (req, res) => {
   const { subject, message, tenantId } = req.body || {};
   if (!subject || !message) return res.status(400).json({ success: false, error: 'subject and message required' });
   try {
+    if (ENABLE_SUPABASE_CHAT) {
+      const data = await supabaseCore.createTicket({ tenantId: tenantId || req.auth.tid || null, userId: req.auth.uid, subject, message });
+      return res.json({ success: true, data });
+    }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const r = await connector.pool.request()
@@ -1941,6 +2037,7 @@ app.post('/api/support/tickets/:id/messages', requireAuth, async (req, res) => {
   const { id } = req.params; const { message } = req.body || {};
   if (!message) return res.status(400).json({ success: false, error: 'message required' });
   try {
+    if (ENABLE_SUPABASE_CHAT) { await supabaseCore.addTicketMessage(parseInt(id), req.auth.uid, message); return res.json({ success: true }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     await connector.pool.request().input('id', parseInt(id)).input('uid', req.auth.uid).input('msg', message)
@@ -1970,6 +2067,15 @@ const CREDIT_PACKS = {
 // Helper – get or create a Stripe customer for a tenant
 async function getOrCreateStripeCustomer(pool, tenantId, userEmail) {
   if (!stripe) throw new Error('Stripe not configured');
+  if (ENABLE_SUPABASE_BILLING) {
+    let customerId = await supabaseCore.getStripeCustomerId(tenantId);
+    if (!customerId) {
+      const customer = await stripe.customers.create({ email: userEmail, metadata: { tenantId: String(tenantId) } });
+      customerId = customer.id;
+      await supabaseCore.upsertStripeCustomerId(tenantId, customerId);
+    }
+    return customerId;
+  }
   // Read existing customer id from DB
   const row = await pool.request()
     .input('tid', sql.Int, tenantId)
@@ -1997,6 +2103,7 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
   try {
     const tid = req.auth.tid;
     if (!tid) return res.status(400).json({ success: false, error: 'tenantId required' });
+    if (ENABLE_SUPABASE_BILLING) { const sub = await supabaseCore.getSubscription(tid); return res.json({ success: true, data: sub }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const r = await connector.pool.request()
@@ -2021,15 +2128,19 @@ app.post('/api/billing/subscribe', requireAuth, async (req, res) => {
     const tid = req.auth.tid;
     if (!tid) return res.status(400).json({ success: false, error: 'tenantId required – log in first' });
 
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    // Get user email for customer creation
-    const uRow = await connector.pool.request()
-      .input('uid', sql.Int, req.auth.uid)
-      .query('SELECT TOP 1 Email FROM dbo.Users WHERE UserId=@uid');
-    const email = uRow.recordset[0]?.Email;
-    const customerId = await getOrCreateStripeCustomer(connector.pool, tid, email);
-    await connector.disconnect();
+    let email, connector;
+    if (ENABLE_SUPABASE_BILLING) {
+      email = await supabaseCore.getUserEmail(req.auth.uid);
+    } else {
+      connector = new AzureSQLConnector();
+      await connector.connect();
+      const uRow = await connector.pool.request()
+        .input('uid', sql.Int, req.auth.uid)
+        .query('SELECT TOP 1 Email FROM dbo.Users WHERE UserId=@uid');
+      email = uRow.recordset[0]?.Email;
+    }
+    const customerId = await getOrCreateStripeCustomer(connector?.pool, tid, email);
+    if (connector) await connector.disconnect();
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -2055,14 +2166,19 @@ app.post('/api/billing/topup', requireAuth, async (req, res) => {
     const tid = req.auth.tid;
     if (!tid) return res.status(400).json({ success: false, error: 'tenantId required' });
 
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    const uRow = await connector.pool.request()
-      .input('uid', sql.Int, req.auth.uid)
-      .query('SELECT TOP 1 Email FROM dbo.Users WHERE UserId=@uid');
-    const email = uRow.recordset[0]?.Email;
-    const customerId = await getOrCreateStripeCustomer(connector.pool, tid, email);
-    await connector.disconnect();
+    let email, connector;
+    if (ENABLE_SUPABASE_BILLING) {
+      email = await supabaseCore.getUserEmail(req.auth.uid);
+    } else {
+      connector = new AzureSQLConnector();
+      await connector.connect();
+      const uRow = await connector.pool.request()
+        .input('uid', sql.Int, req.auth.uid)
+        .query('SELECT TOP 1 Email FROM dbo.Users WHERE UserId=@uid');
+      email = uRow.recordset[0]?.Email;
+    }
+    const customerId = await getOrCreateStripeCustomer(connector?.pool, tid, email);
+    if (connector) await connector.disconnect();
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -2091,13 +2207,18 @@ app.post('/api/billing/portal', requireAuth, async (req, res) => {
     const tid = req.auth.tid;
     if (!tid) return res.status(400).json({ success: false, error: 'tenantId required' });
 
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    const r = await connector.pool.request()
-      .input('tid', sql.Int, tid)
-      .query('SELECT TOP 1 StripeCustomerId FROM dbo.Subscriptions WHERE TenantId=@tid');
-    await connector.disconnect();
-    const customerId = r.recordset[0]?.StripeCustomerId;
+    let customerId;
+    if (ENABLE_SUPABASE_BILLING) {
+      customerId = await supabaseCore.getStripeCustomerId(tid);
+    } else {
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+      const r = await connector.pool.request()
+        .input('tid', sql.Int, tid)
+        .query('SELECT TOP 1 StripeCustomerId FROM dbo.Subscriptions WHERE TenantId=@tid');
+      await connector.disconnect();
+      customerId = r.recordset[0]?.StripeCustomerId;
+    }
     if (!customerId) return res.status(400).json({ success: false, error: 'No Stripe customer found for this tenant' });
 
     const session = await stripe.billingPortal.sessions.create({
@@ -2113,13 +2234,18 @@ app.get('/api/billing/invoices', requireAuth, async (req, res) => {
   try {
     if (!stripe) return res.json({ success: true, data: [] });
     const tid = req.auth.tid;
-    const connector = new AzureSQLConnector();
-    await connector.connect();
-    const r = await connector.pool.request()
-      .input('tid', sql.Int, tid)
-      .query('SELECT TOP 1 StripeCustomerId FROM dbo.Subscriptions WHERE TenantId=@tid');
-    await connector.disconnect();
-    const customerId = r.recordset[0]?.StripeCustomerId;
+    let customerId;
+    if (ENABLE_SUPABASE_BILLING) {
+      customerId = await supabaseCore.getStripeCustomerId(tid);
+    } else {
+      const connector = new AzureSQLConnector();
+      await connector.connect();
+      const r = await connector.pool.request()
+        .input('tid', sql.Int, tid)
+        .query('SELECT TOP 1 StripeCustomerId FROM dbo.Subscriptions WHERE TenantId=@tid');
+      await connector.disconnect();
+      customerId = r.recordset[0]?.StripeCustomerId;
+    }
     if (!customerId) return res.json({ success: true, data: [] });
 
     const invoices = await stripe.invoices.list({ customer: customerId, limit: 12 });
@@ -2152,6 +2278,57 @@ app.post('/api/billing/webhook', async (req, res) => {
   } catch (err) {
     console.error('[Stripe webhook] signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (ENABLE_SUPABASE_BILLING) {
+    try {
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const tid = parseInt(session.metadata?.tenantId);
+        if (!tid) return res.json({ received: true });
+        if (session.mode === 'payment' && session.metadata?.type === 'credit_topup') {
+          const credits = parseInt(session.metadata.credits || '0');
+          const amtCents = parseInt(session.metadata.amountCents || '0');
+          if (credits > 0) {
+            await supabaseCore.addCredits(tid, credits);
+            await supabaseCore.recordCreditTopUp({ tenantId: tid, sessionId: session.id, paymentIntent: session.payment_intent, credits, amountCents: amtCents });
+          }
+        }
+      }
+
+      if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
+        const sub = event.data.object;
+        const tid = parseInt(sub.metadata?.tenantId);
+        if (!tid) return res.json({ received: true });
+        const planName = sub.items?.data?.[0]?.price?.metadata?.planName
+          || Object.keys(PLANS).find(k => PLANS[k].priceId === sub.items?.data?.[0]?.price?.id)
+          || 'pro';
+        const periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+        const cancelAtEnd = Boolean(sub.cancel_at_period_end);
+        await supabaseCore.upsertSubscriptionFromStripe({ tenantId: tid, subId: sub.id, customerId: sub.customer, status: sub.status, planName, periodEnd, cancelAtEnd });
+      }
+
+      if (event.type === 'customer.subscription.deleted') {
+        const sub = event.data.object;
+        const tid = parseInt(sub.metadata?.tenantId);
+        if (tid) await supabaseCore.cancelSubscription(tid);
+      }
+
+      if (event.type === 'invoice.payment_succeeded') {
+        const inv = event.data.object;
+        const tid = await supabaseCore.tenantIdForStripeCustomer(inv.customer);
+        if (tid) await supabaseCore.recordInvoicePaid({ tenantId: tid, stripeInvoiceId: inv.id, amountCents: inv.amount_paid, currency: inv.currency, status: inv.status });
+      }
+
+      if (event.type === 'invoice.payment_failed') {
+        const inv = event.data.object;
+        const tid = await supabaseCore.tenantIdForStripeCustomer(inv.customer);
+        if (tid) await supabaseCore.markSubscriptionPastDue(tid);
+      }
+    } catch (err) {
+      console.error('[Stripe webhook] handler error:', err.message);
+    }
+    return res.json({ received: true });
   }
 
   try {
@@ -2274,6 +2451,7 @@ app.post('/api/billing/webhook', async (req, res) => {
 // Get current user's profile
 app.get('/api/profile', requireAuth, async (req, res) => {
   try{
+    if (ENABLE_SUPABASE_AUTH) { const data = await supabaseCore.getProfile(req.auth.uid, req.auth.tid); return res.json({ success:true, data }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const u = await connector.pool.request()
@@ -2296,6 +2474,10 @@ app.put('/api/profile', requireAuth, async (req, res) => {
   try{
     const { firstName, lastName, fullName, cellPhone, designation } = req.body || {};
     const name = fullName || [firstName||'', lastName||''].join(' ').trim();
+    if (ENABLE_SUPABASE_AUTH) {
+      await supabaseCore.updateProfile({ userId: req.auth.uid, tenantId: req.auth.tid, fullName: name || null, cellPhone: cellPhone || null, designation: designation || null });
+      return res.json({ success:true });
+    }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const r1 = await connector.pool.request()
@@ -2318,6 +2500,15 @@ app.post('/api/profile/change-password', requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   if(!currentPassword || !newPassword) return res.status(400).json({ success:false, error:'currentPassword and newPassword required' });
   try{
+    if (ENABLE_SUPABASE_AUTH) {
+      const authUser = await supabaseAuth.getUserAuthById(req.auth.uid);
+      if (!authUser) return res.status(404).json({ success:false, error:'user not found' });
+      const ok = verifyPassword(currentPassword, authUser.PasswordHash, authUser.PasswordSalt);
+      if (!ok) return res.status(400).json({ success:false, error:'Current password is incorrect' });
+      const { hash, salt } = hashPassword(newPassword);
+      await supabaseCore.changePassword(req.auth.uid, hash, salt);
+      return res.json({ success:true });
+    }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const r = await connector.pool.request().input('uid', req.auth.uid).query('SELECT PasswordHash, PasswordSalt FROM dbo.Users WHERE UserId=@uid');
@@ -2349,11 +2540,15 @@ app.post('/api/profile/avatar', requireAuth, express.json({ limit: '12mb' }), as
     fs.writeFileSync(fpath, buf);
     const publicUrl = `/uploads/${filename}`;
     try{
-      const connector = new AzureSQLConnector();
-      await connector.connect();
-      await connector.pool.request().input('uid', req.auth.uid).input('url', publicUrl)
-        .query('UPDATE dbo.Users SET AvatarUrl=@url WHERE UserId=@uid');
-      await connector.disconnect();
+      if (ENABLE_SUPABASE_AUTH) {
+        await supabaseCore.setAvatarUrl(req.auth.uid, publicUrl);
+      } else {
+        const connector = new AzureSQLConnector();
+        await connector.connect();
+        await connector.pool.request().input('uid', req.auth.uid).input('url', publicUrl)
+          .query('UPDATE dbo.Users SET AvatarUrl=@url WHERE UserId=@uid');
+        await connector.disconnect();
+      }
     }catch{}
     return res.json({ success:true, url: publicUrl });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
@@ -2380,6 +2575,7 @@ async function ensureChartOfAccountsTables(connector){
 // Simple CRUD APIs for Chart of Accounts
 app.get('/api/accounting/accounts', requireAuth, async (req, res)=>{
   try{
+    if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listAccounts(req.auth.tid); return res.json({ success:true, data }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     await ensureChartOfAccountsTables(connector);
@@ -2400,6 +2596,10 @@ app.post('/api/accounting/accounts', requireAuth, async (req, res)=>{
     const notes = (p.notes||'').toString().trim() || null;
     if(!type || !name){
       return res.status(400).json({ success:false, error:'accountType and accountName required' });
+    }
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const id = await supabaseAccounting.createAccount({ tenantId: req.auth.tid, accountType: type, accountName: name, accountNumber: number, notes });
+      return res.json({ success:true, id });
     }
     const connector = new AzureSQLConnector();
     await connector.connect();
@@ -2423,6 +2623,7 @@ app.delete('/api/accounting/accounts/:id', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id);
     if(!id) return res.status(400).json({ success:false, error:'id required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.deleteAccount(req.auth.tid, id); return res.json({ success:true }); }
     const connector = new AzureSQLConnector();
     await connector.connect();
     await ensureChartOfAccountsTables(connector);
@@ -2556,6 +2757,10 @@ async function ensureCompanyProfileTables(connector){
 app.get('/api/company/profile', requireAuth, async (req, res)=>{
   try{
     if(!req.auth.tid) return res.status(400).json({ success:false, error:'tenantId required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const { profile, productLines } = await supabaseAccounting.getCompanyProfile(req.auth.tid);
+      return res.json({ success:true, data: profile, productLines });
+    }
     const connector = new AzureSQLConnector(); await connector.connect();
     await ensureCompanyProfileTables(connector);
     const r = await connector.pool.request().input('tid', req.auth.tid)
@@ -2572,6 +2777,7 @@ app.put('/api/company/profile', requireAuth, async (req, res)=>{
   try{
     if(!req.auth.tid) return res.status(400).json({ success:false, error:'tenantId required' });
     const p = req.body || {};
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.upsertCompanyProfile(req.auth.tid, p); return res.json({ success:true }); }
     const connector = new AzureSQLConnector(); await connector.connect();
     await ensureCompanyProfileTables(connector);
     const rq = connector.pool.request();
@@ -2623,6 +2829,7 @@ app.post('/api/company/logo', requireAuth, express.json({ limit:'12mb' }), async
     const dir = path.join(__dirname, '../public/uploads'); try{ fs.mkdirSync(dir,{recursive:true}); }catch{}
     const filename = `tenant-${req.auth.tid}-logo.${ext}`; const fpath = path.join(dir, filename);
     fs.writeFileSync(fpath, buf); const publicUrl = `/uploads/${filename}`;
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.setCompanyLogo(req.auth.tid, publicUrl); return res.json({ success:true, url: publicUrl }); }
     const connector = new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector);
     await connector.pool.request().input('tid', req.auth.tid).input('url', publicUrl).query('MERGE CompanyProfile AS t USING (SELECT @tid AS TenantId) s ON t.TenantId=s.TenantId WHEN MATCHED THEN UPDATE SET LogoUrl=@url, UpdatedAt=GETDATE() WHEN NOT MATCHED THEN INSERT(TenantId, LogoUrl) VALUES(@tid, @url);');
     await connector.disconnect();
@@ -2632,20 +2839,32 @@ app.post('/api/company/logo', requireAuth, express.json({ limit:'12mb' }), async
 
 // Product lines
 app.get('/api/company/product-lines', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT Id, Name FROM CompanyProductLine WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listProductLines(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT Id, Name FROM CompanyProductLine WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/company/product-lines', requireAuth, async (req, res)=>{
-  try{ const name=(req.body?.name||'').trim(); if(!name) return res.status(400).json({ success:false, error:'name required' }); const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).input('Name', name).query('INSERT INTO CompanyProductLine(TenantId,Name) VALUES(@tid,@Name); SELECT SCOPE_IDENTITY() AS Id'); await connector.disconnect(); return res.json({ success:true, id:r.recordset[0].Id }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ const name=(req.body?.name||'').trim(); if(!name) return res.status(400).json({ success:false, error:'name required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) { const id = await supabaseAccounting.createProductLine(req.auth.tid, name); return res.json({ success:true, id }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).input('Name', name).query('INSERT INTO CompanyProductLine(TenantId,Name) VALUES(@tid,@Name); SELECT SCOPE_IDENTITY() AS Id'); await connector.disconnect(); return res.json({ success:true, id:r.recordset[0].Id }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
-app.delete('/api/company/product-lines/:id', requireAuth, async (req, res)=>{  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyProductLine WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+app.delete('/api/company/product-lines/:id', requireAuth, async (req, res)=>{  try{
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.deleteProductLine(req.auth.tid, parseInt(req.params.id)); return res.json({ success:true }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyProductLine WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 
 // Warehouses CRUD
 app.get('/api/company/warehouses', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT * FROM CompanyWarehouse WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listWarehouses(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT * FROM CompanyWarehouse WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/company/warehouses', requireAuth, async (req, res)=>{
-  try{ const p=req.body||{}; if(!p.name) return res.status(400).json({ success:false, error:'name required' }); const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request()
+  try{ const p=req.body||{}; if(!p.name) return res.status(400).json({ success:false, error:'name required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const id = await supabaseAccounting.createWarehouse({ tenantId: req.auth.tid, name: p.name, addressType: p.addressType, warehouseType: p.warehouseType,
+        address1: p.address1, address2: p.address2, city: p.city, state: p.state, postalCode: p.postalCode, country: p.country });
+      return res.json({ success:true, id });
+    }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request()
       .input('tid', req.auth.tid)
       .input('Name', p.name)
       .input('AddressType', p.addressType||null)
@@ -2659,7 +2878,13 @@ app.post('/api/company/warehouses', requireAuth, async (req, res)=>{
       .query('INSERT INTO CompanyWarehouse(TenantId,Name,AddressType,WarehouseType,Address1,Address2,City,State,PostalCode,Country) VALUES(@tid,@Name,@AddressType,@WarehouseType,@Address1,@Address2,@City,@State,@PostalCode,@Country); SELECT SCOPE_IDENTITY() AS Id'); await connector.disconnect(); return res.json({ success:true, id:r.recordset[0].Id }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.put('/api/company/warehouses/:id', requireAuth, async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const p=req.body||{}; const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request()
+  try{ const id=parseInt(req.params.id); const p=req.body||{};
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      await supabaseAccounting.updateWarehouse({ tenantId: req.auth.tid, id, name: p.name, addressType: p.addressType, warehouseType: p.warehouseType,
+        address1: p.address1, address2: p.address2, city: p.city, state: p.state, postalCode: p.postalCode, country: p.country });
+      return res.json({ success:true });
+    }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request()
       .input('tid', req.auth.tid)
       .input('Id', id)
       .input('Name', p.name||null)
@@ -2673,15 +2898,24 @@ app.put('/api/company/warehouses/:id', requireAuth, async (req, res)=>{
       .input('Country', p.country||null)
       .query('UPDATE CompanyWarehouse SET Name=COALESCE(@Name,Name), AddressType=COALESCE(@AddressType,AddressType), WarehouseType=COALESCE(@WarehouseType,WarehouseType), Address1=COALESCE(@Address1,Address1), Address2=COALESCE(@Address2,Address2), City=COALESCE(@City,City), State=COALESCE(@State,State), PostalCode=COALESCE(@PostalCode,PostalCode), Country=COALESCE(@Country,Country), UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
-app.delete('/api/company/warehouses/:id', requireAuth, async (req, res)=>{  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyWarehouse WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+app.delete('/api/company/warehouses/:id', requireAuth, async (req, res)=>{  try{
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.deleteWarehouse(req.auth.tid, parseInt(req.params.id)); return res.json({ success:true }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyWarehouse WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 
 // Spaces CRUD
 app.get('/api/company/spaces', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT * FROM CompanySpace WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listSpaces(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT * FROM CompanySpace WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/company/spaces', requireAuth, async (req, res)=>{
-  try{ const p=req.body||{}; if(!p.name) return res.status(400).json({ success:false, error:'name required' }); const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request()
+  try{ const p=req.body||{}; if(!p.name) return res.status(400).json({ success:false, error:'name required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const id = await supabaseAccounting.createSpace({ tenantId: req.auth.tid, name: p.name, type: p.type, purpose: p.purpose, floor: p.floor,
+        width: p.width, length: p.length, height: p.height, unit: p.unit, capacity: p.capacity, ventilation: p.ventilation, doors: p.doors, windows: p.windows });
+      return res.json({ success:true, id });
+    }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request()
       .input('tid', req.auth.tid)
       .input('Name', p.name)
       .input('Type', p.type||null)
@@ -2698,18 +2932,28 @@ app.post('/api/company/spaces', requireAuth, async (req, res)=>{
       .query('INSERT INTO CompanySpace(TenantId,Name,Type,Purpose,Floor,Width,Length,Height,Unit,Capacity,Ventilation,Doors,Windows) VALUES(@tid,@Name,@Type,@Purpose,@Floor,@Width,@Length,@Height,@Unit,@Capacity,@Ventilation,@Doors,@Windows); SELECT SCOPE_IDENTITY() AS Id'); await connector.disconnect(); return res.json({ success:true, id:r.recordset[0].Id }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/company/spaces/:id/exit-plan', requireAuth, express.json({limit:'12mb'}), async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const dataUrl=req.body?.dataUrl||''; const m=dataUrl.match(/^data:(image\/(png|jpeg|jpg));base64,(.+)$/i); if(!m) return res.status(400).json({ success:false, error:'Invalid image' }); const ext=m[2].toLowerCase()==='jpeg'?'jpg':m[2].toLowerCase(); const buf=Buffer.from(m[3],'base64'); const fs=require('fs'); const dir=path.join(__dirname,'../public/uploads'); try{ fs.mkdirSync(dir,{recursive:true}); }catch{} const filename=`tenant-${req.auth.tid}-space-${id}.${ext}`; const fpath=path.join(dir,filename); fs.writeFileSync(fpath, buf); const publicUrl='/uploads/'+filename; const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', id).input('url', publicUrl).query('UPDATE CompanySpace SET ExitPlanUrl=@url, UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true, url: publicUrl }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ const id=parseInt(req.params.id); const dataUrl=req.body?.dataUrl||''; const m=dataUrl.match(/^data:(image\/(png|jpeg|jpg));base64,(.+)$/i); if(!m) return res.status(400).json({ success:false, error:'Invalid image' }); const ext=m[2].toLowerCase()==='jpeg'?'jpg':m[2].toLowerCase(); const buf=Buffer.from(m[3],'base64'); const fs=require('fs'); const dir=path.join(__dirname,'../public/uploads'); try{ fs.mkdirSync(dir,{recursive:true}); }catch{} const filename=`tenant-${req.auth.tid}-space-${id}.${ext}`; const fpath=path.join(dir,filename); fs.writeFileSync(fpath, buf); const publicUrl='/uploads/'+filename;
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.setSpaceExitPlan(req.auth.tid, id, publicUrl); return res.json({ success:true, url: publicUrl }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', id).input('url', publicUrl).query('UPDATE CompanySpace SET ExitPlanUrl=@url, UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true, url: publicUrl }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.delete('/api/company/spaces/:id', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanySpace WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.deleteSpace(req.auth.tid, parseInt(req.params.id)); return res.json({ success:true }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanySpace WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 
 // Assets CRUD
 app.get('/api/company/assets', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT * FROM CompanyAssets WHERE TenantId=@tid ORDER BY AssetName'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listAssets(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT * FROM CompanyAssets WHERE TenantId=@tid ORDER BY AssetName'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/company/assets', requireAuth, async (req, res)=>{
-  try{ const p=req.body||{}; if(!p.assetName) return res.status(400).json({ success:false, error:'assetName required' }); const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request()
+  try{ const p=req.body||{}; if(!p.assetName) return res.status(400).json({ success:false, error:'assetName required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const id = await supabaseAccounting.createAsset({ tenantId: req.auth.tid, assetName: p.assetName, assetType: p.assetType, quantity: p.quantity,
+        purchaseDate: p.purchaseDate, purchasePrice: p.purchasePrice, supplier: p.supplier, notes: p.notes });
+      return res.json({ success:true, id });
+    }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request()
       .input('tid', req.auth.tid)
       .input('AssetName', p.assetName)
       .input('AssetType', p.assetType||null)
@@ -2722,7 +2966,13 @@ app.post('/api/company/assets', requireAuth, async (req, res)=>{
       .query('INSERT INTO CompanyAssets(TenantId,AssetName,AssetType,Quantity,PurchaseDate,PurchasePrice,Supplier,Notes,SavedOn) VALUES(@tid,@AssetName,@AssetType,@Quantity,@PurchaseDate,@PurchasePrice,@Supplier,@Notes,@SavedOn); SELECT SCOPE_IDENTITY() AS Id'); await connector.disconnect(); return res.json({ success:true, id:r.recordset[0].Id }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.put('/api/company/assets/:id', requireAuth, async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const p=req.body||{}; const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request()
+  try{ const id=parseInt(req.params.id); const p=req.body||{};
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      await supabaseAccounting.updateAsset({ tenantId: req.auth.tid, id, assetName: p.assetName, assetType: p.assetType, quantity: p.quantity,
+        purchaseDate: p.purchaseDate, purchasePrice: p.purchasePrice, supplier: p.supplier, notes: p.notes });
+      return res.json({ success:true });
+    }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request()
       .input('tid', req.auth.tid)
       .input('Id', id)
       .input('AssetName', p.assetName||null)
@@ -2735,7 +2985,8 @@ app.put('/api/company/assets/:id', requireAuth, async (req, res)=>{
       .query('UPDATE CompanyAssets SET AssetName=COALESCE(@AssetName,AssetName), AssetType=COALESCE(@AssetType,AssetType), Quantity=COALESCE(@Quantity,Quantity), PurchaseDate=COALESCE(@PurchaseDate,PurchaseDate), PurchasePrice=COALESCE(@PurchasePrice,PurchasePrice), Supplier=COALESCE(@Supplier,Supplier), Notes=COALESCE(@Notes,Notes), UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.delete('/api/company/assets/:id', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyAssets WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.deleteAsset(req.auth.tid, parseInt(req.params.id)); return res.json({ success:true }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyAssets WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 
 // ==================== HR (Job Postings, Candidates & Employees) ====================
@@ -2970,6 +3221,7 @@ async function ensureHrTables(connector){
 // Job postings
 app.get('/api/hr/postings', requireAuth, async (req, res)=>{
   try{
+    if (ENABLE_SUPABASE_HR) { const data = await supabaseHr.listPostings(req.auth.tid); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const r=await connector.pool.request().input('tid', req.auth.tid||0)
       .query('SELECT * FROM dbo.JobPosting WHERE TenantId=@tid ORDER BY PostedAt DESC');
@@ -2980,6 +3232,13 @@ app.get('/api/hr/postings', requireAuth, async (req, res)=>{
 app.post('/api/hr/postings', requireAuth, async (req, res)=>{
   try{
     const p=req.body||{}; const title=(p.title||'').trim(); if(!title) return res.status(400).json({ success:false, error:'title required' });
+    if (ENABLE_SUPABASE_HR) {
+      const id = await supabaseHr.createPosting({ tenantId: req.auth.tid, title, department: p.department, type: p.employmentType,
+        openings: parseInt(p.openings||1)||1, location: p.location, salaryRange: p.salaryRange, description: p.jobDescription,
+        requiredQualification: p.requiredQualification, desiredQualification: p.desiredQualification,
+        applicationDeadline: p.applicationDeadline, diversityFlag: p.diversityFlag, eoeFlag: p.eoeFlag });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request();
     rq.input('tid', req.auth.tid||0)
@@ -3006,6 +3265,13 @@ app.put('/api/hr/postings/:id', requireAuth, async (req, res)=>{
   try{
     const id=parseInt(req.params.id);
     const p=req.body||{};
+    if (ENABLE_SUPABASE_HR) {
+      await supabaseHr.updatePosting({ tenantId: req.auth.tid, id, title: p.title, department: p.department, type: p.employmentType,
+        openings: p.openings, location: p.location, salaryRange: p.salaryRange, description: p.jobDescription,
+        requiredQualification: p.requiredQualification, desiredQualification: p.desiredQualification,
+        applicationDeadline: p.applicationDeadline, diversityFlag: p.diversityFlag, eoeFlag: p.eoeFlag });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request();
     rq.input('tid', req.auth.tid||0).input('Id', id)
@@ -3042,6 +3308,7 @@ app.put('/api/hr/postings/:id', requireAuth, async (req, res)=>{
 app.delete('/api/hr/postings/:id', requireAuth, async (req, res)=>{
   try{
     const id=parseInt(req.params.id);
+    if (ENABLE_SUPABASE_HR) { await supabaseHr.deletePosting(req.auth.tid, id); return res.json({ success:true }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     await connector.pool.request().input('tid', req.auth.tid||0).input('Id', id).query('DELETE FROM dbo.JobPosting WHERE Id=@Id AND TenantId=@tid');
     await connector.disconnect();
@@ -3053,6 +3320,10 @@ app.delete('/api/hr/postings/:id', requireAuth, async (req, res)=>{
 app.get('/api/hr/applicants', requireAuth, async (req, res)=>{
   try{
     const { jobTitle, name, email, phone, address, status, shortlisted } = req.query;
+    if (ENABLE_SUPABASE_HR) {
+      const data = await supabaseHr.listApplicants({ tenantId: req.auth.tid, jobTitle, name, email, phone, address, status, shortlisted });
+      return res.json({ success:true, data });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     let sqlTxt = `SELECT c.*, jp.Title AS JobTitle FROM dbo.Candidate c
       LEFT JOIN dbo.JobPosting jp ON jp.Id = c.JobPostingId
@@ -3077,6 +3348,12 @@ app.post('/api/hr/applicants', requireAuth, async (req, res)=>{
     const name=(p.fullName||'').trim();
     const email=(p.email||'').trim();
     if(!name||!email) return res.status(400).json({ success:false, error:'fullName and email required' });
+    if (ENABLE_SUPABASE_HR) {
+      const id = await supabaseHr.createApplicant({ tenantId: req.auth.tid, jobPostingId: p.jobPostingId||null, name, email,
+        phone: p.phone||null, address: p.address||null, linkedin: p.linkedin||null, workAuthStatus: p.workAuthStatus||null,
+        preferredStartDate: p.preferredStartDate||null });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request();
     rq.input('tid', req.auth.tid||0)
@@ -3099,6 +3376,11 @@ app.post('/api/hr/applicants', requireAuth, async (req, res)=>{
 app.post('/api/hr/applicants/:id/shortlist', requireAuth, async (req, res)=>{
   try{
     const id=parseInt(req.params.id); const p=req.body||{};
+    if (ENABLE_SUPABASE_HR) {
+      await supabaseHr.shortlistApplicant({ tenantId: req.auth.tid, id, interviewDate: p.interviewDate||null, interviewTimeSlot: p.interviewTime||null,
+        interviewType: p.interviewType||null, interviewerName: p.interviewerName||null, interviewerTitle: p.interviewerTitle||null, reason: p.reason||null });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     // Save interview details
     const rq=connector.pool.request();
@@ -3121,6 +3403,12 @@ app.post('/api/hr/applicants/:id/shortlist', requireAuth, async (req, res)=>{
 app.post('/api/hr/applicants/:id/evaluation', requireAuth, async (req, res)=>{
   try{
     const id=parseInt(req.params.id); const p=req.body||{};
+    if (ENABLE_SUPABASE_HR) {
+      await supabaseHr.addEvaluation({ tenantId: req.auth.tid, id, evaluatorName: p.interviewerName||null, technicalSkills: p.technicalSkills||null,
+        teamwork: p.teamwork||null, leadership: p.leadership||null, problemSolving: p.problemSolving||null, communication: p.communication||null,
+        testDetails: p.testDetails||null, agenda: p.agenda||null, recommendation: p.recommendation||null });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request();
     rq.input('tid', req.auth.tid||0)
@@ -3147,6 +3435,12 @@ app.post('/api/hr/applicants/:id/evaluation', requireAuth, async (req, res)=>{
 app.post('/api/hr/applicants/:id/offer', requireAuth, async (req, res)=>{
   try{
     const id=parseInt(req.params.id); const p=req.body||{};
+    if (ENABLE_SUPABASE_HR) {
+      await supabaseHr.addOffer({ tenantId: req.auth.tid, id, employmentType: p.employmentType||null, benefits: p.benefits||null,
+        salaryOffer: p.salaryOffer||null, startDate: p.startDate||null, confidentiality: p.confidentiality, nonCompete: p.nonCompete,
+        atWill: p.atWill, offerStatus: p.offerStatus||null });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request();
     rq.input('tid', req.auth.tid||0)
@@ -3176,6 +3470,10 @@ app.post('/api/hr/employees', requireAuth, async (req, res)=>{
     if (!fullName || !email) {
       return res.status(400).json({ success:false, error:'fullName and email required' });
     }
+    if (ENABLE_SUPABASE_HR) {
+      const row = await supabaseHr.createEmployee({ tenantId: req.auth.tid||0, email, fullName, roleName: p.roleName||null, title: p.title||null });
+      return res.json({ success:true, data: row, employeeId: row.CompanyUserId });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const tenantId = req.auth.tid || 0;
     const rq = connector.pool.request();
@@ -3197,6 +3495,7 @@ app.post('/api/hr/employees', requireAuth, async (req, res)=>{
 // HR Employee profile APIs (used by Add New Employee form)
 app.get('/api/hr/employees', requireAuth, async (req, res)=>{
   try{
+    if (ENABLE_SUPABASE_HR) { const data = await supabaseHr.listEmployees(req.auth.tid); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request().input('tid', req.auth.tid||0);
     const q=`SELECT p.Id AS ProfileId, cu.CompanyUserId, u.UserId, u.FullName, u.Email,
@@ -3217,6 +3516,26 @@ app.post('/api/hr/employees/full', requireAuth, async (req, res)=>{
   const body = req.body || {};
   let { employeeId, profile, totals, payDetails } = body;
   try{
+    if (ENABLE_SUPABASE_HR) {
+      const tid = req.auth.tid || 0;
+      if (!employeeId) {
+        const name = (profile?.name || profile?.fullName || body.name || '').trim();
+        const email = (profile?.email || body.email || '').trim();
+        if (!name || !email) {
+          return res.status(400).json({ success:false, error:'Employee name and email are required' });
+        }
+        const { hash, salt } = hashPassword('Welcome123!');
+        const created = await supabaseHr.createEmployee({ tenantId: tid, email, fullName: name, passwordHash: hash, passwordSalt: salt, roleName: profile?.roleName || null, title: profile?.title || null });
+        employeeId = created.CompanyUserId;
+        if (!employeeId) {
+          return res.status(500).json({ success:false, error:'Failed to create employee record' });
+        }
+      }
+      if (profile) await supabaseHr.updateEmployeeProfile(tid, employeeId, profile);
+      if (totals) await supabaseHr.updateEmployeeTotals(tid, employeeId, totals);
+      if (payDetails) await supabaseHr.updateEmployeePayDetails(tid, employeeId, payDetails);
+      return res.json({ success:true, employeeId });
+    }
     const connector = new AzureSQLConnector();
     await connector.connect();
     await ensureHrTables(connector);
@@ -3439,6 +3758,11 @@ app.post('/api/hr/employees/full', requireAuth, async (req, res)=>{
 app.get('/api/hr/employees/:id', requireAuth, async (req, res)=>{
   try{
     const empId=parseInt(req.params.id);
+    if (ENABLE_SUPABASE_HR) {
+      const row = await supabaseHr.getEmployee(req.auth.tid, empId);
+      if (!row) return res.status(404).json({ success:false, error:'not found' });
+      return res.json({ success:true, data: row });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request().input('tid', req.auth.tid||0).input('Eid', empId);
     const q=`SELECT TOP 1 cu.CompanyUserId, u.UserId, u.FullName, u.Email,
@@ -3457,6 +3781,7 @@ app.get('/api/hr/employees/:id', requireAuth, async (req, res)=>{
 app.put('/api/hr/employees/:id', requireAuth, async (req, res)=>{
   try{
     const empId=parseInt(req.params.id); const p=req.body||{};
+    if (ENABLE_SUPABASE_HR) { await supabaseHr.updateEmployeeProfile(req.auth.tid, empId, p); return res.json({ success:true }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request();
     rq.input('tid', req.auth.tid||0)
@@ -3513,6 +3838,7 @@ app.put('/api/hr/employees/:id', requireAuth, async (req, res)=>{
 app.get('/api/hr/employees/:id/totals', requireAuth, async (req, res)=>{
   try{
     const empId=parseInt(req.params.id);
+    if (ENABLE_SUPABASE_HR) { const data = await supabaseHr.getEmployeeTotals(req.auth.tid, empId); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request().input('tid', req.auth.tid||0).input('Eid', empId);
     const r=await rq.query('SELECT TOP 1 * FROM dbo.HrEmployeeTotals WHERE TenantId=@tid AND EmployeeId=@Eid');
@@ -3524,6 +3850,7 @@ app.get('/api/hr/employees/:id/totals', requireAuth, async (req, res)=>{
 app.put('/api/hr/employees/:id/totals', requireAuth, async (req, res)=>{
   try{
     const empId=parseInt(req.params.id); const p=req.body||{};
+    if (ENABLE_SUPABASE_HR) { await supabaseHr.updateEmployeeTotals(req.auth.tid, empId, p); return res.json({ success:true }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request();
     rq.input('tid', req.auth.tid||0)
@@ -3568,6 +3895,7 @@ app.put('/api/hr/employees/:id/totals', requireAuth, async (req, res)=>{
 app.get('/api/hr/employees/:id/pay-details', requireAuth, async (req, res)=>{
   try{
     const empId=parseInt(req.params.id);
+    if (ENABLE_SUPABASE_HR) { const data = await supabaseHr.getEmployeePayDetails(req.auth.tid, empId); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request().input('tid', req.auth.tid||0).input('Eid', empId);
     const r=await rq.query('SELECT TOP 1 * FROM dbo.HrEmployeePayDetails WHERE TenantId=@tid AND EmployeeId=@Eid');
@@ -3579,6 +3907,7 @@ app.get('/api/hr/employees/:id/pay-details', requireAuth, async (req, res)=>{
 app.put('/api/hr/employees/:id/pay-details', requireAuth, async (req, res)=>{
   try{
     const empId=parseInt(req.params.id); const p=req.body||{};
+    if (ENABLE_SUPABASE_HR) { await supabaseHr.updateEmployeePayDetails(req.auth.tid, empId, p); return res.json({ success:true }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request();
     rq.input('tid', req.auth.tid||0)
@@ -3646,10 +3975,43 @@ app.put('/api/hr/employees/:id/pay-details', requireAuth, async (req, res)=>{
 });
 
 // HR Payroll preview based on employee totals (MTD values) and salary details
+// Shared payroll row-shaping logic (basic/tax/fica/net) used by both the
+// Supabase and SQL Server code paths for preview + generate.
+function computePayrollRows(baseRows, period) {
+  return (baseRows||[]).map(row=>{
+    let basic = Number(row.MTD_Gross||0);
+    if (!basic && row.Salary) {
+      basic = Number(row.Salary||0);
+      const freq = (row.PayFrequency||'').toLowerCase();
+      if (freq === 'semi-monthly') basic = basic / 2;
+      else if (freq === 'bi-weekly') basic = basic / 26 * 12;
+      else if (freq === 'weekly') basic = basic / 52 * 12;
+    }
+    let tax = Number(row.MTD_State||0) + Number(row.MTD_Federal||0);
+    if (!tax) {
+      tax = Number(row.FederalWithholding||0) + Number(row.StateWithholding||0);
+    }
+    const fica = Number(row.MTD_Fica||0) || (basic * 0.0765);
+    const other = Number(row.MTD_Other||0) || Number(row.Deductions||0);
+    const absentDays = 0, absentDed = 0, advDed = 0;
+    const net = basic - tax - fica - other - absentDed - advDed;
+    return {
+      EmployeeId: row.EmployeeId, EmployeeName: row.EmployeeName, Period: period,
+      BasicSalary: basic, Tax: tax, Fica: fica, AbsentDays: absentDays,
+      AbsentDeduction: absentDed, AdvanceDeduction: advDed, OtherDeduction: other,
+      NetPay: net > 0 ? net : 0
+    };
+  });
+}
+
 app.get('/api/hr/payroll/preview', requireAuth, async (req, res)=>{
   try{
     const period = (req.query.period||'').toString();
     if(!period) return res.status(400).json({ success:false, error:'period required' });
+    if (ENABLE_SUPABASE_HR) {
+      const baseRows = await supabaseHr.getPayrollBaseRows(req.auth.tid);
+      return res.json({ success:true, data: computePayrollRows(baseRows, period) });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request().input('tid', req.auth.tid||0);
     const sqlTxt = `SELECT cu.CompanyUserId AS EmployeeId, u.FullName AS EmployeeName,
@@ -3718,6 +4080,25 @@ app.post('/api/hr/payroll/generate', requireAuth, async (req, res)=>{
     const body = req.body||{};
     const period = (body.period||'').toString();
     if(!period) return res.status(400).json({ success:false, error:'period required' });
+    if (ENABLE_SUPABASE_HR) {
+      const baseRows = await supabaseHr.getPayrollBaseRows(req.auth.tid);
+      const rows = computePayrollRows(baseRows, period);
+      let dueDate = null;
+      try{
+        const parts = period.split('-');
+        const yy = parseInt(parts[0]||''); const mm = parseInt(parts[1]||'');
+        if(yy && mm) dueDate = new Date(yy, mm, 0);
+      }catch(e){}
+      let created = 0;
+      for(const row of rows){
+        const amt = Number(row.NetPay||0);
+        if(!amt) continue;
+        await supabaseHr.insertApInvoice({ tenantId: req.auth.tid, orderId: `PAY-${period}-${row.EmployeeId}`, productName: `Salary ${period}`,
+          dueDate, supplierName: row.EmployeeName || 'Employee', amount: amt, notes: 'Payroll generated from HR module', createdBy: req.auth.uid||null });
+        created++;
+      }
+      return res.json({ success:true, count: created });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector); await ensureAccountingTables(connector); await ensureApArTables(connector);
     const rq=connector.pool.request().input('tid', req.auth.tid||0);
     const sqlTxt = `SELECT cu.CompanyUserId AS EmployeeId, u.FullName AS EmployeeName,
@@ -3818,6 +4199,10 @@ app.post('/api/hr/payroll/seed-salary', requireAuth, async (req, res)=>{
     if(!salary || isNaN(salary) || salary <= 0){
       return res.status(400).json({ success:false, error:'amount must be a positive number' });
     }
+    if (ENABLE_SUPABASE_HR) {
+      const updated = await supabaseHr.seedSalary(req.auth.tid, salary);
+      return res.json({ success:true, amount: salary, employees: updated });
+    }
     const connector = new AzureSQLConnector();
     await connector.connect();
     await ensureHrTables(connector);
@@ -3890,6 +4275,10 @@ async function ensureCrmExtraTables(connector){
 app.get('/api/crm/notes', requireAuth, async (req, res)=>{
   try{
     const { customer, salesperson, from, to } = req.query;
+    if (ENABLE_SUPABASE_CRM) {
+      const data = await supabaseCrm.getNotes({ tenantId: req.auth.tid, customer, salesperson, from, to });
+      return res.json({ success:true, data });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmExtraTables(connector);
     let sqlTxt = 'SELECT Id, Subject, Body, FollowUpAt, CreatedAt, CustomerName, SalesPersonName FROM dbo.PhoneNotes WHERE TenantId=@tid';
     const rq = connector.pool.request().input('tid', req.auth.tid||0);
@@ -3908,6 +4297,11 @@ app.post('/api/crm/notes', requireAuth, async (req, res)=>{
     const body=(p.body||'').trim();
     const subject=(p.subject||'').trim();
     if(!body) return res.status(400).json({ success:false, error:'body required' });
+    if (ENABLE_SUPABASE_CRM) {
+      const id = await supabaseCrm.createNote({ tenantId: req.auth.tid, userId: req.auth.uid, subject, body,
+        followUpAt: p.followUpAt? new Date(p.followUpAt): null, customerName: p.customerName||null, salesPersonName: p.salesPersonName||null });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmExtraTables(connector);
     const rq = connector.pool.request()
       .input('tid', req.auth.tid||0)
@@ -3924,20 +4318,25 @@ app.post('/api/crm/notes', requireAuth, async (req, res)=>{
 
 // CRM Segments
 app.get('/api/crm/segments', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmExtraTables(connector);
+  try{
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getSegments(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmExtraTables(connector);
     const r=await connector.pool.request().input('tid', req.auth.tid||0).query('SELECT Id, Name, CreatedAt FROM dbo.Segments WHERE TenantId=@tid ORDER BY Name');
     await connector.disconnect(); return res.json({ success:true, data:r.recordset });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/crm/segments', requireAuth, async (req, res)=>{
   try{ const p=req.body||{}; const name=(p.name||'').trim(); if(!name) return res.status(400).json({ success:false, error:'name required' });
+    if (ENABLE_SUPABASE_CRM) { const id = await supabaseCrm.createSegment(req.auth.tid, name); return res.json({ success:true, id }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmExtraTables(connector);
     const r=await connector.pool.request().input('tid', req.auth.tid||0).input('Name', name).query('INSERT INTO dbo.Segments(TenantId,Name) VALUES(@tid,@Name); SELECT SCOPE_IDENTITY() AS Id');
     await connector.disconnect(); return res.json({ success:true, id:r.recordset[0].Id });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.delete('/api/crm/segments/:id', requireAuth, async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmExtraTables(connector);
+  try{ const id=parseInt(req.params.id);
+    if (ENABLE_SUPABASE_CRM) { await supabaseCrm.deleteSegment(req.auth.tid, id); return res.json({ success:true }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmExtraTables(connector);
     await connector.pool.request().input('tid', req.auth.tid||0).input('Id', id).query('DELETE FROM dbo.Segments WHERE Id=@Id AND TenantId=@tid; DELETE FROM dbo.CrmSegmentCompanies WHERE SegmentId=@Id AND TenantId=@tid;');
     await connector.disconnect(); return res.json({ success:true });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
@@ -3947,6 +4346,7 @@ app.delete('/api/crm/segments/:id', requireAuth, async (req, res)=>{
 app.get('/api/crm/segments/:id/companies', requireAuth, async (req, res)=>{
   try{
     const segId = parseInt(req.params.id);
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getSegmentCompanies(req.auth.tid, segId); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmExtraTables(connector); await ensureCrmCoreTables(connector);
     const rq = connector.pool.request().input('tid', req.auth.tid||0).input('sid', segId);
     const sql = `SELECT c.Id, c.CompanyName, c.City, c.Country, c.Status
@@ -3964,6 +4364,7 @@ app.post('/api/crm/segments/:id/companies', requireAuth, express.json(), async (
     const segId = parseInt(req.params.id);
     const body = req.body||{};
     const ids = Array.isArray(body.companyIds)? body.companyIds.map(x=>parseInt(x)).filter(x=>x>0): [];
+    if (ENABLE_SUPABASE_CRM) { await supabaseCrm.setSegmentCompanies(req.auth.tid, segId, ids); return res.json({ success:true }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmExtraTables(connector); await ensureCrmCoreTables(connector);
     const tid = req.auth.tid||0;
     await connector.pool.request().input('sid', segId).input('tid', tid).query('DELETE FROM dbo.CrmSegmentCompanies WHERE SegmentId=@sid AND TenantId=@tid');
@@ -4051,11 +4452,13 @@ app.get('/api/crm/countries', requireAuth, async (_req, res)=>{
 });
 
 app.get('/api/crm/categories', requireAuth, async (req, res)=>{
-  try{ const role=(req.query.role||'').toLowerCase()||'buyer'; const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
+  try{ const role=(req.query.role||'').toLowerCase()||'buyer';
+    const defaults = role==='buyer'? ['Retailer','Wholesaler','Brand','Other'] : role==='manufacturer'? ['OEM','ODM','Contract','Other'] : ['Preferred','Standard','Blocked','Other'];
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getOrSeedCategories(req.auth.tid, role, defaults); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
     // seed a few if missing
     const r1=await connector.pool.request().input('tid', req.auth.tid||0).input('role', role).query('SELECT Id, Name FROM dbo.CrmCategories WHERE TenantId=@tid AND RoleCode=@role ORDER BY Name');
     if(r1.recordset.length===0){
-      const defaults = role==='buyer'? ['Retailer','Wholesaler','Brand','Other'] : role==='manufacturer'? ['OEM','ODM','Contract','Other'] : ['Preferred','Standard','Blocked','Other'];
       for(const n of defaults){ await connector.pool.request().input('tid', req.auth.tid||0).input('role', role).input('Name', n).query('INSERT INTO dbo.CrmCategories(TenantId,RoleCode,Name) VALUES(@tid,@role,@Name)'); }
     }
     const r=await connector.pool.request().input('tid', req.auth.tid||0).input('role', role).query('SELECT Id, Name FROM dbo.CrmCategories WHERE TenantId=@tid AND RoleCode=@role ORDER BY Name');
@@ -4067,6 +4470,10 @@ app.get('/api/crm/categories', requireAuth, async (req, res)=>{
 app.post('/api/crm/companies', requireAuth, async (req, res)=>{
   try{
     const p=req.body||{}; const name=(p.companyName||'').trim(); if(!name) return res.status(400).json({success:false,error:'companyName required'});
+    if (ENABLE_SUPABASE_CRM) {
+      const id = await supabaseCrm.createCompany({ tenantId: req.auth.tid, userId: req.auth.uid||null, company: { ...p, companyName: name }, persons: Array.isArray(p.persons)? p.persons: [], categoryIds: Array.isArray(p.categoryIds)? p.categoryIds: [] });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
     const rq=connector.pool.request();
     rq.input('tid', req.auth.tid||0).input('uid', req.auth.uid||null)
@@ -4102,6 +4509,11 @@ app.post('/api/crm/companies', requireAuth, async (req, res)=>{
 app.get('/api/crm/companies/:id', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id);
+    if (ENABLE_SUPABASE_CRM) {
+      const result = await supabaseCrm.getCompany(req.auth.tid, id);
+      if (!result) return res.status(404).json({ success:false, error:'not found' });
+      return res.json({ success:true, data: result });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
     const rq = connector.pool.request().input('Id', id).input('tid', req.auth.tid||0);
     const c = await rq.query('SELECT TOP 1 * FROM dbo.CrmCompanies WHERE Id=@Id AND TenantId=@tid');
@@ -4119,6 +4531,10 @@ app.put('/api/crm/companies/:id', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id);
     const p=req.body||{};
+    if (ENABLE_SUPABASE_CRM) {
+      await supabaseCrm.updateCompany({ tenantId: req.auth.tid, id, company: p, persons: Array.isArray(p.persons)? p.persons: [], categoryIds: Array.isArray(p.categoryIds)? p.categoryIds: [] });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
     const rq=connector.pool.request().input('Id', id).input('tid', req.auth.tid||0)
       .input('CompanyName', p.companyName||null).input('CompanyDetails', p.companyDetails||null).input('CompanyType', p.companyType||null)
@@ -4176,6 +4592,7 @@ app.put('/api/crm/companies/:id', requireAuth, async (req, res)=>{
 // List/search companies
 app.get('/api/crm/companies', requireAuth, async (req, res)=>{
   try{ const q=(req.query.q||'').toString().trim(); const role=(req.query.role||'').toLowerCase(); const status=(req.query.status||'').toString();
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.listCompanies({ tenantId: req.auth.tid, q, role, status }); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
     let sqlTxt = `SELECT TOP 200 c.Id, c.CompanyName, c.CompanyType, c.Product, c.Phone, c.City, c.State, c.Zip, c.Country, c.Status,
                     (SELECT TOP 1 (COALESCE(p.FirstName,'')+' '+COALESCE(p.LastName,'')) FROM dbo.CrmContactPersons p WHERE p.CompanyId=c.Id) AS ContactName,
@@ -4191,7 +4608,9 @@ app.get('/api/crm/companies', requireAuth, async (req, res)=>{
 });
 
 app.delete('/api/crm/companies/:id', requireAuth, async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
+  try{ const id=parseInt(req.params.id);
+    if (ENABLE_SUPABASE_CRM) { await supabaseCrm.deleteCompany(id); return res.json({ success:true }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
     await connector.pool.request().input('Id', id).query('DELETE FROM dbo.CrmCompanyCategoryMap WHERE CompanyId=@Id; DELETE FROM dbo.CrmContactPersons WHERE CompanyId=@Id; DELETE FROM dbo.CrmCompanies WHERE Id=@Id');
     await connector.disconnect(); return res.json({ success:true });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
@@ -4199,7 +4618,13 @@ app.delete('/api/crm/companies/:id', requireAuth, async (req, res)=>{
 
 // Upgrade: Lead -> Account -> NA
 app.post('/api/crm/companies/:id/upgrade', requireAuth, async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
+  try{ const id=parseInt(req.params.id);
+    if (ENABLE_SUPABASE_CRM) {
+      const next = await supabaseCrm.upgradeCompanyStatus(id);
+      if (next === null) return res.status(404).json({ success:false, error:'not found' });
+      return res.json({ success:true, status: next });
+    }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmCoreTables(connector);
     const r=await connector.pool.request().input('Id', id).query('SELECT TOP 1 Status FROM dbo.CrmCompanies WHERE Id=@Id');
     if(r.recordset.length===0){ await connector.disconnect(); return res.status(404).json({ success:false, error:'not found' }); }
     const st=(r.recordset[0].Status||'Lead'); const next = st==='Lead'? 'Account' : st==='Account'? 'NA' : 'Lead';
@@ -4257,13 +4682,19 @@ async function ensureCrmDashboardTables(connector){
 
 // CRM Dashboard APIs
 app.get('/api/crm/appointments', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmDashboardTables(connector);
+  try{
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getAppointments(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmDashboardTables(connector);
     const r=await connector.pool.request().input('tid', req.auth.tid||0).query(`SELECT TOP 50 Id, Company, Notes, WhenAt, CreatedAt FROM dbo.CrmAppointments WHERE TenantId=@tid ORDER BY WhenAt ASC`);
     await connector.disconnect(); return res.json({ success:true, data:r.recordset });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/crm/appointments', requireAuth, async (req, res)=>{
   try{ const p=req.body||{}; const whenAt=p.whenAt? new Date(p.whenAt): null; if(!whenAt) return res.status(400).json({success:false,error:'whenAt required'});
+    if (ENABLE_SUPABASE_CRM) {
+      const id = await supabaseCrm.createAppointment({ tenantId: req.auth.tid, company: p.company||null, notes: p.notes||null, whenAt, userId: req.auth.uid||null });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmDashboardTables(connector);
     const r=await connector.pool.request().input('tid', req.auth.tid||0).input('comp', (p.company||null)).input('notes', (p.notes||null)).input('whenAt', whenAt).input('uid', req.auth.uid||null)
       .query(`INSERT INTO dbo.CrmAppointments(TenantId,Company,Notes,WhenAt,CreatedBy) VALUES(@tid,@comp,@notes,@whenAt,@uid); SELECT SCOPE_IDENTITY() AS Id`);
@@ -4271,7 +4702,9 @@ app.post('/api/crm/appointments', requireAuth, async (req, res)=>{
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.get('/api/crm/campaigns', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmDashboardTables(connector);
+  try{
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getCampaigns(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmDashboardTables(connector);
     const r=await connector.pool.request().input('tid', req.auth.tid||0).query(`SELECT TOP 50 Id, Name, Subject, ScheduledAt, CreatedAt FROM dbo.CrmEmailCampaigns WHERE TenantId=@tid ORDER BY CreatedAt DESC`);
     await connector.disconnect(); return res.json({ success:true, data:r.recordset });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
@@ -4279,6 +4712,10 @@ app.get('/api/crm/campaigns', requireAuth, async (req, res)=>{
 app.post('/api/crm/campaigns', requireAuth, async (req, res)=>{
   try{ const p=req.body||{}; const name=(p.name||'').trim(); if(!name) return res.status(400).json({ success:false, error:'name required' });
     const when = p.scheduledAt? new Date(p.scheduledAt): null;
+    if (ENABLE_SUPABASE_CRM) {
+      const id = await supabaseCrm.createCampaign({ tenantId: req.auth.tid, name, subject: p.subject||null, scheduledAt: when, userId: req.auth.uid||null });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmDashboardTables(connector);
     const r=await connector.pool.request().input('tid', req.auth.tid||0).input('Name', name).input('Subject', p.subject||null).input('ScheduledAt', when).input('uid', req.auth.uid||null)
       .query(`INSERT INTO dbo.CrmEmailCampaigns(TenantId,Name,Subject,ScheduledAt,CreatedBy) VALUES(@tid,@Name,@Subject,@ScheduledAt,@uid); SELECT SCOPE_IDENTITY() AS Id`);
@@ -4286,7 +4723,9 @@ app.post('/api/crm/campaigns', requireAuth, async (req, res)=>{
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.get('/api/crm/summary', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmDashboardTables(connector);
+  try{
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getSummary(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmDashboardTables(connector);
     const qContacts = await connector.pool.request().query('SELECT COUNT(*) AS C FROM contactTest');
     const qLeads = await connector.pool.request().input('tid', req.auth.tid||0).query('SELECT COUNT(*) AS C FROM dbo.CrmLeads WHERE TenantId=@tid');
     const qAccounts = await connector.pool.request().input('tid', req.auth.tid||0).query('SELECT COUNT(*) AS C FROM dbo.CrmAccounts WHERE TenantId=@tid');
@@ -4322,6 +4761,7 @@ async function ensureEmailTables(connector){
 app.get('/api/crm/email', requireAuth, async (req, res)=>{
   try{
     const folder = (req.query.folder||'Inbox').toString();
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getEmails(req.auth.tid, req.auth.uid||null, folder); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureEmailTables(connector);
     const rq = connector.pool.request().input('tid', req.auth.tid||0).input('uid', req.auth.uid||null).input('folder', folder);
     const sql = `SELECT Id, Folder, FromAddress, ToAddresses, CcAddresses, Subject, Body, AttachmentsJson, SentAt, CreatedAt
@@ -4336,6 +4776,11 @@ app.get('/api/crm/email', requireAuth, async (req, res)=>{
 app.get('/api/crm/email/:id', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id);
+    if (ENABLE_SUPABASE_CRM) {
+      const data = await supabaseCrm.getEmailById(req.auth.tid, req.auth.uid||null, id);
+      if (!data) return res.status(404).json({ success:false, error:'not found' });
+      return res.json({ success:true, data });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureEmailTables(connector);
     const rq = connector.pool.request().input('tid', req.auth.tid||0).input('uid', req.auth.uid||null).input('id', id);
     const sql = `SELECT TOP 1 Id, Folder, FromAddress, ToAddresses, CcAddresses, Subject, Body, AttachmentsJson, SentAt, CreatedAt
@@ -4361,25 +4806,31 @@ app.post('/api/crm/email', requireAuth, express.json({ limit:'2mb' }), async (re
     // Always store the email in the local Emails table so the mailbox UI works,
     // and, when the folder is "Sent" and SMTP is configured, also send it out
     // via the same nodemailer transporter that is used for auth emails.
-    const connector=new AzureSQLConnector(); await connector.connect(); await ensureEmailTables(connector);
-    const rq = connector.pool.request()
-      .input('tid', req.auth.tid||0)
-      .input('uid', req.auth.uid||null)
-      .input('folder', folder)
-      .input('from', process.env.SMTP_FROM || 'noreply@complytex.com')
-      .input('to', toAddresses||null)
-      .input('cc', ccAddresses)
-      .input('sub', subject||null)
-      .input('body', body||null)
-      .input('att', attachmentsJson)
-      .input('sent', folder==='Sent'? new Date(): null);
-    const sql = `INSERT INTO dbo.Emails(TenantId,UserId,Folder,FromAddress,ToAddresses,CcAddresses,Subject,Body,AttachmentsJson,SentAt)
-                 VALUES(@tid,@uid,@folder,@from,@to,@cc,@sub,@body,@att,@sent);
-                 SELECT SCOPE_IDENTITY() AS Id`;
-    const r = await rq.query(sql);
-    await connector.disconnect();
-
-    const dbId = r.recordset[0].Id;
+    let dbId;
+    if (ENABLE_SUPABASE_CRM) {
+      dbId = await supabaseCrm.createEmail({ tenantId: req.auth.tid, userId: req.auth.uid||null, folder,
+        fromAddress: process.env.SMTP_FROM || 'noreply@complytex.com', toAddresses: toAddresses||null, ccAddresses,
+        subject: subject||null, body: body||null, attachmentsJson, sentAt: folder==='Sent'? new Date(): null });
+    } else {
+      const connector=new AzureSQLConnector(); await connector.connect(); await ensureEmailTables(connector);
+      const rq = connector.pool.request()
+        .input('tid', req.auth.tid||0)
+        .input('uid', req.auth.uid||null)
+        .input('folder', folder)
+        .input('from', process.env.SMTP_FROM || 'noreply@complytex.com')
+        .input('to', toAddresses||null)
+        .input('cc', ccAddresses)
+        .input('sub', subject||null)
+        .input('body', body||null)
+        .input('att', attachmentsJson)
+        .input('sent', folder==='Sent'? new Date(): null);
+      const sql = `INSERT INTO dbo.Emails(TenantId,UserId,Folder,FromAddress,ToAddresses,CcAddresses,Subject,Body,AttachmentsJson,SentAt)
+                   VALUES(@tid,@uid,@folder,@from,@to,@cc,@sub,@body,@att,@sent);
+                   SELECT SCOPE_IDENTITY() AS Id`;
+      const r = await rq.query(sql);
+      await connector.disconnect();
+      dbId = r.recordset[0].Id;
+    }
 
     // If this is a real sent email and SMTP is available, send it now.
     if (folder === 'Sent' && transporter && toAddresses) {
@@ -4425,6 +4876,7 @@ app.post('/api/crm/email', requireAuth, express.json({ limit:'2mb' }), async (re
 app.delete('/api/crm/email/:id', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id);
+    if (ENABLE_SUPABASE_CRM) { await supabaseCrm.deleteEmail(req.auth.tid, req.auth.uid||null, id); return res.json({ success:true }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureEmailTables(connector);
     await connector.pool.request().input('tid', req.auth.tid||0).input('uid', req.auth.uid||null).input('id', id)
       .query('DELETE FROM dbo.Emails WHERE TenantId=@tid AND (UserId=@uid OR @uid IS NULL) AND Id=@id');
@@ -4484,6 +4936,7 @@ async function ensureCrmLeadsOrdersTables(connector){
 // CRM Leads CRUD
 app.get('/api/crm/leads', requireAuth, async (req, res)=>{
   try{
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getLeads(req.auth.tid); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmLeadsOrdersTables(connector);
     const r = await connector.pool.request().input('tid', req.auth.tid||0)
       .query('SELECT * FROM dbo.CrmLeads WHERE TenantId=@tid ORDER BY CreatedAt DESC');
@@ -4495,6 +4948,11 @@ app.get('/api/crm/leads', requireAuth, async (req, res)=>{
 app.post('/api/crm/leads', requireAuth, async (req, res)=>{
   try{
     const p = req.body||{};
+    if (ENABLE_SUPABASE_CRM) {
+      const id = await supabaseCrm.createLead({ tenantId: req.auth.tid, leadName: p.leadName||'', company: p.company||'', email: p.email||'',
+        phone: p.phone||null, status: p.status||'New', estimatedValue: p.estimatedValue||0, source: p.source||null, notes: p.notes||null, userId: req.auth.uid||null });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmLeadsOrdersTables(connector);
     const r = await connector.pool.request()
       .input('tid', req.auth.tid||0)
@@ -4519,6 +4977,11 @@ app.put('/api/crm/leads/:id', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id||'');
     const p = req.body||{};
+    if (ENABLE_SUPABASE_CRM) {
+      await supabaseCrm.updateLead({ tenantId: req.auth.tid, id, leadName: p.leadName||'', company: p.company||'', email: p.email||'',
+        phone: p.phone||null, status: p.status||'New', estimatedValue: p.estimatedValue||0, source: p.source||null, notes: p.notes||null });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmLeadsOrdersTables(connector);
     await connector.pool.request()
       .input('tid', req.auth.tid||0)
@@ -4542,6 +5005,7 @@ app.put('/api/crm/leads/:id', requireAuth, async (req, res)=>{
 // CRM Orders CRUD
 app.get('/api/crm/orders', requireAuth, async (req, res)=>{
   try{
+    if (ENABLE_SUPABASE_CRM) { const data = await supabaseCrm.getOrders(req.auth.tid); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmLeadsOrdersTables(connector);
     const r = await connector.pool.request().input('tid', req.auth.tid||0)
       .query('SELECT * FROM dbo.CrmOrders WHERE TenantId=@tid ORDER BY CreatedAt DESC');
@@ -4553,6 +5017,12 @@ app.get('/api/crm/orders', requireAuth, async (req, res)=>{
 app.post('/api/crm/orders', requireAuth, async (req, res)=>{
   try{
     const p = req.body||{};
+    if (ENABLE_SUPABASE_CRM) {
+      const { orderId, orderNumber } = await supabaseCrm.createOrder({ tenantId: req.auth.tid, orderType: p.orderType, partyName: p.partyName,
+        contactPerson: p.contactPerson, email: p.email, address: p.address, items: p.items, subtotal: p.subtotal, tax: p.tax,
+        totalAmount: p.totalAmount, status: p.status, notes: p.notes, userId: req.auth.uid||null });
+      return res.json({ success:true, id: orderId, orderNumber });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmLeadsOrdersTables(connector);
     const r = await connector.pool.request()
       .input('tid', req.auth.tid||0)
@@ -4585,6 +5055,11 @@ app.put('/api/crm/orders/:id', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id||'');
     const p = req.body||{};
+    if (ENABLE_SUPABASE_CRM) {
+      await supabaseCrm.updateOrder({ tenantId: req.auth.tid, id, orderType: p.orderType, partyName: p.partyName, contactPerson: p.contactPerson,
+        email: p.email, address: p.address, items: p.items, subtotal: p.subtotal, tax: p.tax, totalAmount: p.totalAmount, status: p.status, notes: p.notes });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmLeadsOrdersTables(connector);
     await connector.pool.request()
       .input('tid', req.auth.tid||0)
@@ -4613,6 +5088,7 @@ app.put('/api/crm/orders/:id', requireAuth, async (req, res)=>{
 app.post('/api/crm/orders/:id/ship', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id||'');
+    if (ENABLE_SUPABASE_CRM) { await supabaseCrm.shipOrder(req.auth.tid, id); return res.json({ success:true }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureCrmLeadsOrdersTables(connector);
     await connector.pool.request()
       .input('tid', req.auth.tid||0)
@@ -4628,10 +5104,18 @@ app.post('/api/crm/orders/:id/ship', requireAuth, async (req, res)=>{
 app.post('/api/crm/orders/:id/create-ar', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id||'');
+    if (ENABLE_SUPABASE_CRM) {
+      const order = await supabaseCrm.getOrderByType(req.auth.tid, id, 'Sales');
+      if (!order) return res.status(404).json({ success:false, error:'order not found' });
+      const dueDate = new Date(); dueDate.setDate(dueDate.getDate() + 30);
+      const invoiceId = await supabaseAccounting.createAr({ tenantId: req.auth.tid, orderId: order.OrderNumber, productName: 'Sales Order ' + order.OrderNumber,
+        dueDate, customerName: order.PartyName, amount: order.TotalAmount, docUrl: null, notes: order.Notes||null, createdBy: req.auth.uid||null });
+      return res.json({ success:true, invoiceId });
+    }
     const connector=new AzureSQLConnector(); await connector.connect();
     await ensureCrmLeadsOrdersTables(connector);
     await ensureApArTables(connector);
-    
+
     // Load order
     const orderRes = await connector.pool.request()
       .input('tid', req.auth.tid||0)
@@ -4667,10 +5151,18 @@ app.post('/api/crm/orders/:id/create-ar', requireAuth, async (req, res)=>{
 app.post('/api/crm/orders/:id/create-ap', requireAuth, async (req, res)=>{
   try{
     const id = parseInt(req.params.id||'');
+    if (ENABLE_SUPABASE_CRM) {
+      const order = await supabaseCrm.getOrderByType(req.auth.tid, id, 'Procurement');
+      if (!order) return res.status(404).json({ success:false, error:'order not found' });
+      const dueDate = new Date(); dueDate.setDate(dueDate.getDate() + 30);
+      const invoiceId = await supabaseAccounting.createAp({ tenantId: req.auth.tid, orderId: order.OrderNumber, productName: 'Purchase Order ' + order.OrderNumber,
+        dueDate, supplierName: order.PartyName, amount: order.TotalAmount, docUrl: null, notes: order.Notes||null, createdBy: req.auth.uid||null });
+      return res.json({ success:true, invoiceId });
+    }
     const connector=new AzureSQLConnector(); await connector.connect();
     await ensureCrmLeadsOrdersTables(connector);
     await ensureApArTables(connector);
-    
+
     // Load order
     const orderRes = await connector.pool.request()
       .input('tid', req.auth.tid||0)
@@ -4746,14 +5238,17 @@ async function ensureAccountingTables(connector){
 
 // Banks: list
 app.get('/api/accounting/banks', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listBanks(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
     const r=await connector.pool.request().input('tid', req.auth.tid||0).query("SELECT BankId, Name, AccountTitle, AccountNumber, BranchName, Notes, OpeningBalance, CreatedAt FROM dbo.Banks WHERE TenantId=@tid ORDER BY Name");
     await connector.disconnect(); return res.json({ success:true, data:r.recordset });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 // Banks: get
 app.get('/api/accounting/banks/:id', requireAuth, async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
+  try{ const id=parseInt(req.params.id);
+    if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.getBank(req.auth.tid, id); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
     const r=await connector.pool.request().input('tid', req.auth.tid||0).input('id', id).query("SELECT TOP 1 BankId, Name, AccountTitle, AccountNumber, BranchName, Notes, OpeningBalance, CreatedAt FROM dbo.Banks WHERE TenantId=@tid AND BankId=@id");
     await connector.disconnect(); return res.json({ success:true, data:r.recordset[0]||null });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
@@ -4761,6 +5256,10 @@ app.get('/api/accounting/banks/:id', requireAuth, async (req, res)=>{
 // Banks: create
 app.post('/api/accounting/banks', requireAuth, async (req, res)=>{
   try{ const p=req.body||{}; const name=(p.name||'').trim(); if(!name) return res.status(400).json({success:false,error:'name required'});
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const id = await supabaseAccounting.createBank({ tenantId: req.auth.tid, name, title: p.title, number: p.number, branchName: p.branchName, notes: p.notes, openingBalance: parseFloat(p.openingBalance||0)||0 });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
     const rq=connector.pool.request(); rq.input('tid', req.auth.tid||0); rq.input('Name', name); rq.input('AccountTitle', p.title||null); rq.input('AccountNumber', p.number||null); rq.input('BranchName', p.branchName||null); rq.input('Notes', p.notes||null); rq.input('OpeningBalance', parseFloat(p.openingBalance||0)||0);
     const r=await rq.query("INSERT INTO dbo.Banks(TenantId,Name,AccountTitle,AccountNumber,BranchName,Notes,OpeningBalance) VALUES(@tid,@Name,@AccountTitle,@AccountNumber,@BranchName,@Notes,@OpeningBalance); SELECT SCOPE_IDENTITY() AS BankId");
@@ -4774,6 +5273,7 @@ app.get('/api/accounting/ledger', requireAuth, async (req, res)=>{
     const bankId = parseInt(req.query.bankId||'')||null;
     const type = (req.query.type||'').toUpperCase()==='CR' ? 'CR' : (req.query.type||'').toUpperCase()==='DR' ? 'DR' : null;
     const limit = parseInt(req.query.limit||'') || 0;
+    if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listLedger({ tenantId: req.auth.tid, bankId, type, limit }); return res.json({ success:true, data }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
     let sqlTxt = 'SELECT ' + (limit>0 ? 'TOP (@lim) ' : '') + 'LedgerId, BankId, EntryType, Amount, Quantity, Reference, Party, SlipNumber, DocUrl, EntryDate FROM dbo.BankLedger WHERE TenantId=@tid';
     const rq=connector.pool.request().input('tid', req.auth.tid||0);
@@ -4787,6 +5287,11 @@ app.get('/api/accounting/ledger', requireAuth, async (req, res)=>{
 // Ledger: add single entry
 app.post('/api/accounting/ledger', requireAuth, async (req, res)=>{
   try{ const p=req.body||{}; const bankId=parseInt(p.bankId||''); const amount=Number(p.amount||0); const type=(p.type||'').toUpperCase(); if(!bankId||!amount||!(type==='CR'||type==='DR')) return res.status(400).json({success:false,error:'bankId, amount, type required'});
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const id = await supabaseAccounting.addLedgerEntry({ tenantId: req.auth.tid, bankId, type, amount, quantity: p.quantity!=null? parseInt(p.quantity)||0 : null,
+        reference: p.reference, party: p.party, slipNumber: p.slipNumber, docUrl: p.docUrl, entryDate: p.entryDate? new Date(p.entryDate): new Date(), createdBy: req.auth.uid });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
     const rq=connector.pool.request(); rq.input('tid', req.auth.tid||0); rq.input('bid', bankId); rq.input('et', type); rq.input('amt', amount); rq.input('qty', p.quantity!=null? parseInt(p.quantity)||0 : null); rq.input('ref', p.reference||null); rq.input('party', p.party||null); rq.input('slip', p.slipNumber||null); rq.input('doc', p.docUrl||null); rq.input('dt', p.entryDate? new Date(p.entryDate): new Date()); rq.input('uid', req.auth.uid||null);
     const r=await rq.query("INSERT INTO dbo.BankLedger(TenantId,BankId,EntryType,Amount,Quantity,Reference,Party,SlipNumber,DocUrl,EntryDate,CreatedBy) VALUES(@tid,@bid,@et,@amt,@qty,@ref,@party,@slip,@doc,@dt,@uid); SELECT SCOPE_IDENTITY() AS LedgerId");
@@ -4796,6 +5301,7 @@ app.post('/api/accounting/ledger', requireAuth, async (req, res)=>{
 // Transfer: DR from source, CR to target
 app.post('/api/accounting/transfer', requireAuth, async (req, res)=>{
   try{ const p=req.body||{}; const fromId=parseInt(p.fromId||''); const toId=parseInt(p.toId||''); const amount=Number(p.amount||0); const reference=p.reference||'Internal transfer'; if(!fromId||!toId||!amount||fromId===toId) return res.status(400).json({success:false,error:'Invalid params'});
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.transfer({ tenantId: req.auth.tid, fromId, toId, amount, reference, userId: req.auth.uid }); return res.json({ success:true }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
     const now=new Date();
     const rq=connector.pool.request(); rq.input('tid', req.auth.tid||0); rq.input('uid', req.auth.uid||null); rq.input('amt', amount); rq.input('ref', reference); rq.input('dt', now); rq.input('from', fromId); rq.input('to', toId);
@@ -4854,7 +5360,9 @@ async function ensureApArTables(connector){
 
 // AP: list/create/approve/pay
 app.get('/api/accounting/ap', requireAuth, async (req, res)=>{
-  try{ const status=((req.query.status||'').toString()||null); const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector); await ensureApArTables(connector);
+  try{ const status=((req.query.status||'').toString()||null);
+    if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listAp(req.auth.tid, status); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector); await ensureApArTables(connector);
     let sqlTxt = 'SELECT Id, OrderId, ProductName, DueDate, SupplierName, Amount, Status, DocUrl, Notes, BankId, CreatedAt, ApprovedAt, PaidAt FROM dbo.APInvoices WHERE TenantId=@tid';
     const rq = connector.pool.request().input('tid', req.auth.tid||0);
     if(status){ sqlTxt += ' AND Status=@st'; rq.input('st', status); }
@@ -4864,6 +5372,11 @@ app.get('/api/accounting/ap', requireAuth, async (req, res)=>{
 });
 app.post('/api/accounting/ap', requireAuth, async (req, res)=>{
   try{ const p=req.body||{}; const amt=Number(p.amount||0); if(!amt) return res.status(400).json({ success:false, error:'amount required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const id = await supabaseAccounting.createAp({ tenantId: req.auth.tid, orderId: p.orderId, productName: p.productName, dueDate: p.dueDate? new Date(p.dueDate): null,
+        supplierName: p.supplierName, amount: amt, docUrl: p.docUrl, notes: p.notes, createdBy: req.auth.uid });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector); await ensureApArTables(connector);
     const rq=connector.pool.request(); rq.input('tid', req.auth.tid||0).input('OrderId', p.orderId||null).input('ProductName', p.productName||null).input('DueDate', p.dueDate? new Date(p.dueDate): null).input('SupplierName', p.supplierName||null).input('Amount', amt).input('DocUrl', p.docUrl||null).input('Notes', p.notes||null).input('uid', req.auth.uid||null);
     const r=await rq.query("INSERT INTO dbo.APInvoices(TenantId,OrderId,ProductName,DueDate,SupplierName,Amount,DocUrl,Notes,CreatedBy) VALUES(@tid,@OrderId,@ProductName,@DueDate,@SupplierName,@Amount,@DocUrl,@Notes,@uid); SELECT SCOPE_IDENTITY() AS Id");
@@ -4872,6 +5385,7 @@ app.post('/api/accounting/ap', requireAuth, async (req, res)=>{
 });
 app.post('/api/accounting/ap/:id/approve', requireAuth, async (req, res)=>{
   try{ const id=parseInt(req.params.id||''); if(!id) return res.status(400).json({ success:false, error:'id required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.approveAp(req.auth.tid, id, req.auth.uid); return res.json({ success:true }); }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureApArTables(connector);
     await connector.pool.request().input('tid', req.auth.tid||0).input('Id', id).input('uid', req.auth.uid||null).query("UPDATE dbo.APInvoices SET Status='Approved', ApprovedAt=GETDATE(), ApprovedBy=@uid WHERE TenantId=@tid AND Id=@Id AND Status='Pending'");
     await connector.disconnect(); return res.json({ success:true });
@@ -4879,6 +5393,16 @@ app.post('/api/accounting/ap/:id/approve', requireAuth, async (req, res)=>{
 });
 app.post('/api/accounting/ap/:id/pay', requireAuth, async (req, res)=>{
   try{ const id=parseInt(req.params.id||''); const p=req.body||{}; const bankId=parseInt(p.bankId||''); if(!id||!bankId) return res.status(400).json({ success:false, error:'id and bankId required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const inv = await supabaseAccounting.getAp(req.auth.tid, id);
+      if (!inv) return res.status(404).json({ success:false, error:'not found' });
+      const payAmt = Number(p.amount||inv.Amount||0);
+      const reference = p.reference || (inv.OrderId? ('AP '+inv.OrderId): ('AP#'+id));
+      const party = inv.SupplierName || 'Supplier';
+      await supabaseAccounting.addLedgerEntry({ tenantId: req.auth.tid, bankId, type: 'DR', amount: payAmt, reference, party, slipNumber: p.slipNumber, docUrl: p.docUrl, entryDate: new Date(), createdBy: req.auth.uid });
+      await supabaseAccounting.payAp({ tenantId: req.auth.tid, id, bankId, userId: req.auth.uid });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector); await ensureApArTables(connector);
     // Load invoice
     const invRes = await connector.pool.request().input('tid', req.auth.tid||0).input('Id', id).query('SELECT TOP 1 * FROM dbo.APInvoices WHERE TenantId=@tid AND Id=@Id');
@@ -4895,7 +5419,9 @@ app.post('/api/accounting/ap/:id/pay', requireAuth, async (req, res)=>{
 
 // AR: list/create/receive
 app.get('/api/accounting/ar', requireAuth, async (req, res)=>{
-  try{ const status=((req.query.status||'').toString()||null); const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector); await ensureApArTables(connector);
+  try{ const status=((req.query.status||'').toString()||null);
+    if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listAr(req.auth.tid, status); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector); await ensureApArTables(connector);
     let sqlTxt = 'SELECT Id, OrderId, ProductName, DueDate, CustomerName, Amount, Status, DocUrl, Notes, BankId, CreatedAt, ReceivedAt FROM dbo.ARInvoices WHERE TenantId=@tid';
     const rq = connector.pool.request().input('tid', req.auth.tid||0);
     if(status){ sqlTxt += ' AND Status=@st'; rq.input('st', status); }
@@ -4905,6 +5431,11 @@ app.get('/api/accounting/ar', requireAuth, async (req, res)=>{
 });
 app.post('/api/accounting/ar', requireAuth, async (req, res)=>{
   try{ const p=req.body||{}; const amt=Number(p.amount||0); if(!amt) return res.status(400).json({ success:false, error:'amount required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const id = await supabaseAccounting.createAr({ tenantId: req.auth.tid, orderId: p.orderId, productName: p.productName, dueDate: p.dueDate? new Date(p.dueDate): null,
+        customerName: p.customerName, amount: amt, docUrl: p.docUrl, notes: p.notes, createdBy: req.auth.uid });
+      return res.json({ success:true, id });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector); await ensureApArTables(connector);
     const rq=connector.pool.request(); rq.input('tid', req.auth.tid||0).input('OrderId', p.orderId||null).input('ProductName', p.productName||null).input('DueDate', p.dueDate? new Date(p.dueDate): null).input('CustomerName', p.customerName||null).input('Amount', amt).input('DocUrl', p.docUrl||null).input('Notes', p.notes||null).input('uid', req.auth.uid||null);
     const r=await rq.query("INSERT INTO dbo.ARInvoices(TenantId,OrderId,ProductName,DueDate,CustomerName,Amount,DocUrl,Notes,CreatedBy) VALUES(@tid,@OrderId,@ProductName,@DueDate,@CustomerName,@Amount,@DocUrl,@Notes,@uid); SELECT SCOPE_IDENTITY() AS Id");
@@ -4913,6 +5444,16 @@ app.post('/api/accounting/ar', requireAuth, async (req, res)=>{
 });
 app.post('/api/accounting/ar/:id/receive', requireAuth, async (req, res)=>{
   try{ const id=parseInt(req.params.id||''); const p=req.body||{}; const bankId=parseInt(p.bankId||''); if(!id||!bankId) return res.status(400).json({ success:false, error:'id and bankId required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const inv = await supabaseAccounting.getAr(req.auth.tid, id);
+      if (!inv) return res.status(404).json({ success:false, error:'not found' });
+      const recAmt = Number(p.amount||inv.Amount||0);
+      const reference = p.reference || (inv.OrderId? ('AR '+inv.OrderId): ('AR#'+id));
+      const party = inv.CustomerName || 'Customer';
+      await supabaseAccounting.addLedgerEntry({ tenantId: req.auth.tid, bankId, type: 'CR', amount: recAmt, reference, party, slipNumber: p.slipNumber, docUrl: p.docUrl, entryDate: new Date(), createdBy: req.auth.uid });
+      await supabaseAccounting.receiveAr({ tenantId: req.auth.tid, id, bankId, userId: req.auth.uid });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector); await ensureApArTables(connector);
     const invRes = await connector.pool.request().input('tid', req.auth.tid||0).input('Id', id).query('SELECT TOP 1 * FROM dbo.ARInvoices WHERE TenantId=@tid AND Id=@Id');
     const inv = invRes.recordset[0]; if(!inv){ await connector.disconnect(); return res.status(404).json({ success:false, error:'not found' }); }
@@ -4929,6 +5470,10 @@ app.post('/api/accounting/ar/:id/receive', requireAuth, async (req, res)=>{
 // Bank deposit endpoint (CR into bank with slip/doc)
 app.post('/api/accounting/deposits', requireAuth, async (req, res)=>{
   try{ const p=req.body||{}; const bankId=parseInt(p.bankId||''); const amt=Number(p.amount||0)||0; if(!bankId||!amt) return res.status(400).json({ success:false, error:'bankId and amount required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      await supabaseAccounting.addLedgerEntry({ tenantId: req.auth.tid, bankId, type: 'CR', amount: amt, reference: p.reference||'Deposit', party: p.notes||null, slipNumber: p.slipNumber, docUrl: p.docUrl, entryDate: new Date(), createdBy: req.auth.uid });
+      return res.json({ success:true });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
     const rq=connector.pool.request(); rq.input('tid', req.auth.tid||0).input('bid', bankId).input('amt', amt).input('ref', p.reference||'Deposit').input('party', p.notes||null).input('slip', p.slipNumber||null).input('doc', p.docUrl||null).input('dt', new Date()).input('uid', req.auth.uid||null);
     await rq.query("INSERT INTO dbo.BankLedger(TenantId,BankId,EntryType,Amount,Reference,Party,SlipNumber,DocUrl,EntryDate,CreatedBy) VALUES(@tid,@bid,'CR',@amt,@ref,@party,@slip,@doc,@dt,@uid)");
@@ -4938,7 +5483,9 @@ app.post('/api/accounting/deposits', requireAuth, async (req, res)=>{
 
 // Bank summary (with current balance)
 app.get('/api/accounting/bank-summary', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
+  try{
+    if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.bankSummary(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureAccountingTables(connector);
     const rq = connector.pool.request().input('tid', req.auth.tid||0);
     const q = `SELECT b.BankId, b.Name, b.AccountTitle, b.AccountNumber, b.BranchName, b.Notes, b.OpeningBalance,
       b.OpeningBalance + (
@@ -5077,9 +5624,23 @@ async function ensureChatTables(connector){
 // List selectable users (same tenant first)
 app.get('/api/chat/users', requireAuth, async (req, res) => {
   try{
-    const connector = new AzureSQLConnector(); await connector.connect();
     const tidParam = parseInt(req.query.tenantId || '') || null;
     const effectiveTid = tidParam || req.auth.tid || null;
+    if (ENABLE_SUPABASE_CHAT) {
+      let list = await supabaseCore.chatUsers(effectiveTid);
+      if (list.length === 0) {
+        const mtid = await supabaseCore.userPrimaryTenant(req.auth.uid);
+        if (mtid) list = await supabaseCore.chatUsers(mtid);
+      }
+      if (list.length === 0 && process.env.AUTO_SEED_DEMO !== '0') {
+        const emails = ['hr@demo.example','sales@demo.example','buyer@demo.example','supplier@demo.example','designer@demo.example','auditor@demo.example','safety@demo.example','inspection@demo.example'];
+        for (const e of emails) { try { await ensureDemoUser(e); } catch {} }
+        const mtid = (await supabaseCore.userPrimaryTenant(req.auth.uid)) || effectiveTid;
+        if (mtid) list = await supabaseCore.chatUsers(mtid);
+      }
+      return res.json({ success:true, data: list });
+    }
+    const connector = new AzureSQLConnector(); await connector.connect();
     let qres;
     if(effectiveTid){
       qres = await connector.pool.request().input('tid', effectiveTid).query(`
@@ -5134,6 +5695,7 @@ app.get('/api/chat/users', requireAuth, async (req, res) => {
 // List conversations for current user
 app.get('/api/chat/conversations', requireAuth, async (req, res) => {
   try{
+    if (ENABLE_SUPABASE_CHAT) { const data = await supabaseCore.listConversations(req.auth.uid); return res.json({ success:true, data }); }
     const connector = new AzureSQLConnector(); await connector.connect(); await ensureChatTables(connector);
 const r = await connector.pool.request().input('uid', req.auth.uid).query(`
       SELECT c.Id, c.Title, c.CreatedAt,
@@ -5153,8 +5715,12 @@ async function createConversation(req, res){
     const title = (req.body?.title||'').trim();
     const memberIds = Array.isArray(req.body?.memberIds)? req.body.memberIds.map(x=>parseInt(x)).filter(n=>Number.isFinite(n)&&n>0): [];
     if(!title) return res.status(400).json({ success:false, error:'title required' });
-    const connector = new AzureSQLConnector(); await connector.connect(); await ensureChatTables(connector);
     const tenantId = parseInt(req.body?.tenantId||'') || req.auth.tid || null;
+    if (ENABLE_SUPABASE_CHAT) {
+      const id = await supabaseCore.createConversation({ title, userId: req.auth.uid, tenantId, memberIds });
+      return res.json({ success:true, data: { id } });
+    }
+    const connector = new AzureSQLConnector(); await connector.connect(); await ensureChatTables(connector);
     const rq = connector.pool.request();
     rq.input('Title', title); rq.input('uid', req.auth.uid); rq.input('tid', tenantId);
     const conv = await rq.query('INSERT INTO dbo.Conversations(Title, CreatedBy, TenantId) VALUES(@Title, @uid, @tid); SELECT SCOPE_IDENTITY() AS Id');
@@ -5176,6 +5742,11 @@ app.post('/api/chat/start', requireAuth, express.json(), createConversation);
 app.get('/api/chat/conversations/:id/messages', requireAuth, async (req, res) => {
   try{
     const id = parseInt(req.params.id);
+    if (ENABLE_SUPABASE_CHAT) {
+      if (!(await supabaseCore.isConversationMember(id, req.auth.uid))) return res.status(403).json({ success:false, error:'forbidden' });
+      const data = await supabaseCore.getMessages(id);
+      return res.json({ success:true, data });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureChatTables(connector);
     // verify membership
     const mem = await connector.pool.request().input('cid', id).input('uid', req.auth.uid)
@@ -5195,6 +5766,11 @@ app.post('/api/chat/conversations/:id/messages', requireAuth, express.json(), as
   try{
     const id = parseInt(req.params.id); const body = (req.body?.body||'').trim();
     if(!body) return res.status(400).json({ success:false, error:'body required' });
+    if (ENABLE_SUPABASE_CHAT) {
+      if (!(await supabaseCore.isConversationMember(id, req.auth.uid))) return res.status(403).json({ success:false, error:'forbidden' });
+      const msgId = await supabaseCore.postMessage(id, req.auth.uid, body);
+      return res.json({ success:true, id: msgId });
+    }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureChatTables(connector);
     // verify membership
     const mem = await connector.pool.request().input('cid', id).input('uid', req.auth.uid)
@@ -5210,10 +5786,16 @@ app.post('/api/chat/conversations/:id/messages', requireAuth, express.json(), as
 // ==================== PROFILE/COMPANY CONTINUES ====================
 // Certifications CRUD
 app.get('/api/company/certifications', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT * FROM CompanyCertification WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listCertifications(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT * FROM CompanyCertification WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/company/certifications', requireAuth, async (req, res)=>{
-  try{ const p=req.body||{}; if(!p.name) return res.status(400).json({ success:false, error:'name required' }); const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request()
+  try{ const p=req.body||{}; if(!p.name) return res.status(400).json({ success:false, error:'name required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) {
+      const id = await supabaseAccounting.createCertification({ tenantId: req.auth.tid, type: p.type, policy: p.policy, name: p.name, validFrom: p.validFrom, validTill: p.validTill, detail: p.detail });
+      return res.json({ success:true, id });
+    }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request()
       .input('tid', req.auth.tid)
       .input('Type', p.type||null)
       .input('Policy', p.policy||null)
@@ -5224,33 +5806,46 @@ app.post('/api/company/certifications', requireAuth, async (req, res)=>{
       .query('INSERT INTO CompanyCertification(TenantId,Type,Policy,Name,ValidFrom,ValidTill,Detail) VALUES(@tid,@Type,@Policy,@Name,@ValidFrom,@ValidTill,@Detail); SELECT SCOPE_IDENTITY() AS Id'); await connector.disconnect(); return res.json({ success:true, id:r.recordset[0].Id }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/company/certifications/:id/image', requireAuth, express.json({limit:'12mb'}), async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const dataUrl=req.body?.dataUrl||''; const m=dataUrl.match(/^data:(image\/(png|jpeg|jpg));base64,(.+)$/i); if(!m) return res.status(400).json({ success:false, error:'Invalid image' }); const ext=m[2].toLowerCase()==='jpeg'?'jpg':m[2].toLowerCase(); const buf=Buffer.from(m[3],'base64'); const fs=require('fs'); const dir=path.join(__dirname,'../public/uploads'); try{ fs.mkdirSync(dir,{recursive:true}); }catch{} const filename=`tenant-${req.auth.tid}-cert-${id}.${ext}`; const fpath=path.join(dir,filename); fs.writeFileSync(fpath, buf); const publicUrl='/uploads/'+filename; const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', id).input('url', publicUrl).query('UPDATE CompanyCertification SET CertImageUrl=@url, UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true, url: publicUrl }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ const id=parseInt(req.params.id); const dataUrl=req.body?.dataUrl||''; const m=dataUrl.match(/^data:(image\/(png|jpeg|jpg));base64,(.+)$/i); if(!m) return res.status(400).json({ success:false, error:'Invalid image' }); const ext=m[2].toLowerCase()==='jpeg'?'jpg':m[2].toLowerCase(); const buf=Buffer.from(m[3],'base64'); const fs=require('fs'); const dir=path.join(__dirname,'../public/uploads'); try{ fs.mkdirSync(dir,{recursive:true}); }catch{} const filename=`tenant-${req.auth.tid}-cert-${id}.${ext}`; const fpath=path.join(dir,filename); fs.writeFileSync(fpath, buf); const publicUrl='/uploads/'+filename;
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.setCertificationImage(req.auth.tid, id, publicUrl); return res.json({ success:true, url: publicUrl }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', id).input('url', publicUrl).query('UPDATE CompanyCertification SET CertImageUrl=@url, UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true, url: publicUrl }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/company/certifications/:id/logo', requireAuth, express.json({limit:'12mb'}), async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const dataUrl=req.body?.dataUrl||''; const m=dataUrl.match(/^data:(image\/(png|jpeg|jpg));base64,(.+)$/i); if(!m) return res.status(400).json({ success:false, error:'Invalid image' }); const ext=m[2].toLowerCase()==='jpeg'?'jpg':m[2].toLowerCase(); const buf=Buffer.from(m[3],'base64'); const fs=require('fs'); const dir=path.join(__dirname,'../public/uploads'); try{ fs.mkdirSync(dir,{recursive:true}); }catch{} const filename=`tenant-${req.auth.tid}-certlogo-${id}.${ext}`; const fpath=path.join(dir,filename); fs.writeFileSync(fpath, buf); const publicUrl='/uploads/'+filename; const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', id).input('url', publicUrl).query('UPDATE CompanyCertification SET LogoUrl=@url, UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true, url: publicUrl }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ const id=parseInt(req.params.id); const dataUrl=req.body?.dataUrl||''; const m=dataUrl.match(/^data:(image\/(png|jpeg|jpg));base64,(.+)$/i); if(!m) return res.status(400).json({ success:false, error:'Invalid image' }); const ext=m[2].toLowerCase()==='jpeg'?'jpg':m[2].toLowerCase(); const buf=Buffer.from(m[3],'base64'); const fs=require('fs'); const dir=path.join(__dirname,'../public/uploads'); try{ fs.mkdirSync(dir,{recursive:true}); }catch{} const filename=`tenant-${req.auth.tid}-certlogo-${id}.${ext}`; const fpath=path.join(dir,filename); fs.writeFileSync(fpath, buf); const publicUrl='/uploads/'+filename;
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.setCertificationLogo(req.auth.tid, id, publicUrl); return res.json({ success:true, url: publicUrl }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', id).input('url', publicUrl).query('UPDATE CompanyCertification SET LogoUrl=@url, UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true, url: publicUrl }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
-app.delete('/api/company/certifications/:id', requireAuth, async (req, res)=>{  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyCertification WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+app.delete('/api/company/certifications/:id', requireAuth, async (req, res)=>{  try{
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.deleteCertification(req.auth.tid, parseInt(req.params.id)); return res.json({ success:true }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyCertification WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 
 // Unions CRUD
 app.get('/api/company/unions', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT Id, Name, Description FROM CompanyUnion WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { const data = await supabaseAccounting.listUnions(req.auth.tid); return res.json({ success:true, data }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).query('SELECT Id, Name, Description FROM CompanyUnion WHERE TenantId=@tid ORDER BY Name'); await connector.disconnect(); return res.json({ success:true, data:r.recordset }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.post('/api/company/unions', requireAuth, async (req, res)=>{
-  try{ const p=req.body||{}; const name=(p.name||'').trim(); if(!name) return res.status(400).json({ success:false, error:'name required' }); const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).input('Name', name).input('Description', (p.description||null)).query('INSERT INTO CompanyUnion(TenantId,Name,Description) VALUES(@tid,@Name,@Description); SELECT SCOPE_IDENTITY() AS Id'); await connector.disconnect(); return res.json({ success:true, id:r.recordset[0].Id }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ const p=req.body||{}; const name=(p.name||'').trim(); if(!name) return res.status(400).json({ success:false, error:'name required' });
+    if (ENABLE_SUPABASE_ACCOUNTING) { const id = await supabaseAccounting.createUnion(req.auth.tid, name, p.description||null); return res.json({ success:true, id }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); const r=await connector.pool.request().input('tid', req.auth.tid).input('Name', name).input('Description', (p.description||null)).query('INSERT INTO CompanyUnion(TenantId,Name,Description) VALUES(@tid,@Name,@Description); SELECT SCOPE_IDENTITY() AS Id'); await connector.disconnect(); return res.json({ success:true, id:r.recordset[0].Id }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.put('/api/company/unions/:id', requireAuth, async (req, res)=>{
-  try{ const id=parseInt(req.params.id); const p=req.body||{}; const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', id).input('Name', (p.name||null)).input('Description', (p.description||null)).query('UPDATE CompanyUnion SET Name=COALESCE(@Name,Name), Description=COALESCE(@Description,Description), UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ const id=parseInt(req.params.id); const p=req.body||{};
+    if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.updateUnion({ tenantId: req.auth.tid, id, name: p.name, description: p.description }); return res.json({ success:true }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', id).input('Name', (p.name||null)).input('Description', (p.description||null)).query('UPDATE CompanyUnion SET Name=COALESCE(@Name,Name), Description=COALESCE(@Description,Description), UpdatedAt=GETDATE() WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 app.delete('/api/company/unions/:id', requireAuth, async (req, res)=>{
-  try{ const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyUnion WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+  try{ if (ENABLE_SUPABASE_ACCOUNTING) { await supabaseAccounting.deleteUnion(req.auth.tid, parseInt(req.params.id)); return res.json({ success:true }); }
+    const connector=new AzureSQLConnector(); await connector.connect(); await ensureCompanyProfileTables(connector); await connector.pool.request().input('tid', req.auth.tid).input('Id', parseInt(req.params.id)).query('DELETE FROM CompanyUnion WHERE Id=@Id AND TenantId=@tid'); await connector.disconnect(); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 
 // ==================== SAFETY OFFICER API ROUTES ====================
 
 // ==================== SAFETY OFFICER API ROUTES ====================
 // Setup safety routes
-const { setupSafetyRoutes } = require('./safety-api');
+const ENABLE_SUPABASE_SAFETY = process.env.ENABLE_SUPABASE_SAFETY === '1';
+const { setupSafetyRoutes } = require(ENABLE_SUPABASE_SAFETY ? './safety-api-supabase' : './safety-api');
 let safetyPool = null;
 
 // Initialize database connection for safety routes
@@ -5315,7 +5910,23 @@ app.listen(PORT, () => {
   console.log('');
 });
 
-// ── Initialize DB pool and safety routes in the background (non-blocking) ──
+// ── Postgres safety routes: no SQL Server dependency, register immediately ──
+if (ENABLE_SUPABASE_SAFETY) {
+  setupSafetyRoutes(app);
+  const pgPool = require('./db/supabase').createSupabasePgPool();
+  try { require('./safety-agent-api-supabase').setupSafetyAgentRoutes(app, pgPool, requireAuth); } catch (e) { console.warn('SafetyAgent (Supabase) not loaded:', e.message); }
+  try { require('./routes/water-management-supabase').setupWaterManagementRoutes(app); } catch (e) { console.warn('Water Management API (Supabase) not loaded:', e.message); }
+  try { require('./routes/waste-management-supabase').setupWasteManagementRoutes(app); } catch (e) { console.warn('Waste Management API (Supabase) not loaded:', e.message); }
+  try { require('./routes/checklist-api-supabase').setupChecklistRoutes(app); } catch (e) { console.warn('Safety Checklist API (Supabase) not loaded:', e.message); }
+  try {
+    const { setupChecklistSuggestionsRoutes } = require('./routes/checklist-suggestions');
+    setupChecklistSuggestionsRoutes(app, null);
+    console.log('✅ Safety Checklist AI Suggestions loaded');
+  } catch (e) { console.warn('Safety Checklist Suggestions API not loaded:', e.message); }
+  console.log('✅ Postgres safety routes initialized');
+  autoSeedDemoIfNeeded();
+} else
+// ── Initialize SQL Server pool and safety routes in the background (non-blocking) ──
 initSafetyPool()
   .then(pool => {
     setupSafetyRoutes(app, pool);

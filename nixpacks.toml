@@ -8,4 +8,4 @@ cmds = ["npm install"]
 cmds = ["echo 'No build step required'"]
 
 [start]
-cmd = "sh -c 'node src/setup-db.js > /tmp/setup-db.log 2>&1 & node src/web-server.js'"
+cmd = "node src/web-server.js"

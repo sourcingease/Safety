@@ -7,6 +7,13 @@ This folder contains a working migration kit for your app.
 - `01_schema.sql` → full PostgreSQL schema for core + CRM + HR + accounting + chat/email tables
 - `02_functions.sql` → PostgreSQL function equivalents for your current SQL Server procedures
 - `03_seed.sql` → seed data (business types, modules, permissions)
+- `04_safety_schema.sql` → PostgreSQL schema for the Safety domain (fire/gas/electrical/boiler/
+  structural inspections, DSA, consultant engagement, safety audits/RFQ/training/grievances/
+  incidents/documents, water/waste management) — generated from SQL Server introspection since
+  this domain wasn't covered by the original schema kit. Source tables have no FK constraints,
+  check constraints, triggers, or views (confirmed via `sys.foreign_keys` / `sys.check_constraints`
+  / `sys.triggers` / `sys.views`), so none were invented on the Postgres side either. Unique
+  constraints and non-unique indexes that did exist in SQL Server were carried over.
 
 ## 1) Required env vars
 
@@ -26,6 +33,8 @@ Add these to your `.env`:
 Run:
 
 `node scripts/setup-supabase.js`
+
+(applies `01_schema.sql`, `02_functions.sql`, `03_seed.sql`, `04_safety_schema.sql` in order)
 
 ## 3) Copy existing data from SQL Server
 

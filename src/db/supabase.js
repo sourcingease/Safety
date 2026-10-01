@@ -1,6 +1,16 @@
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// node-pg returns NUMERIC/DECIMAL and INT8/BIGINT as strings by default (to
+// avoid silent precision loss for values outside the safe JS integer range).
+// The SQL Server driver this app was built against returns these as plain
+// JS numbers, and the API responses/frontend expect that shape. This app's
+// money/decimal and bigint columns (ledger ids, audit ids, etc.) never
+// approach the range where that precision loss would matter, so parse both
+// as numbers here, once, for every pool created from this module.
+types.setTypeParser(1700, (v) => (v === null ? null : parseFloat(v))); // numeric/decimal
+types.setTypeParser(20, (v) => (v === null ? null : parseInt(v, 10))); // int8/bigint
 
 function createSupabaseClient() {
   const url = process.env.SUPABASE_URL;

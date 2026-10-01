@@ -41,6 +41,7 @@ create or replace function sp_register_owner(
 returns table (tenant_id integer, user_id integer, role_id integer)
 language plpgsql
 as $$
+#variable_conflict use_column
 declare
   v_bt_id integer;
   v_tenant_id integer;
@@ -106,6 +107,7 @@ create or replace function sp_create_employee(
 returns table (user_id integer, role_id integer)
 language plpgsql
 as $$
+#variable_conflict use_column
 declare
   v_user_id integer;
   v_role_id integer;
