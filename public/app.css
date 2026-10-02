@@ -366,3 +366,65 @@ button.ct.primary:hover {
     font-size: 16px; /* Prevents zoom on iOS */
   }
 }
+
+/* ===== Shared app header (.dashboard-header) =====
+ * Default look for every page header; master-layout.js injects its icon
+ * toolbar into .header-right. Wrapped in :where() (zero specificity) so pages
+ * that style their own header (e.g. masters/safety-office.html) still win.
+ */
+:where(.dashboard-header) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 8px 12px 4px 12px;
+  padding: 12px 20px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  border-bottom: 3px solid #0ea5e9;
+}
+:where(.dashboard-header .header-left) {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+:where(.dashboard-header .logo-small) {
+  max-height: 40px;
+  width: auto;
+}
+:where(.dashboard-header .dashboard-title) {
+  font-size: 18px;
+  font-weight: 700;
+  color: #0f172a;
+  letter-spacing: -0.02em;
+}
+:where(.dashboard-header .header-right) {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  position: relative; /* anchors the user dropdown */
+}
+:where(.dashboard-header .header-right > a) {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0284c7;
+  text-decoration: none;
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+:where(.dashboard-header .header-right > a:hover) {
+  background: #f1f5f9;
+}
+@media (max-width: 768px) {
+  :where(.dashboard-header) {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  :where(.dashboard-header .dashboard-title) {
+    font-size: 16px;
+  }
+}

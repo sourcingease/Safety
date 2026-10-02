@@ -32,6 +32,20 @@
     .muted{color:#6b7280;font-size:13px}
     .hidden{display:none}
     label{font-size:13px;color:#0f172a}
+    /* Let master-layout's injected icon toolbar wrap instead of pushing the header off-screen */
+    .dashboard-header{flex-wrap:wrap;gap:12px}
+    .header-left{min-width:0}
+    .header-right{flex-wrap:wrap}
+    .logo-small{width:auto}
+    /* Tables scroll inside their card on narrow screens */
+    .card{overflow-x:auto}
+    .card table{min-width:560px}
+    @media (max-width:768px){
+      .dashboard-header{flex-direction:column;align-items:flex-start}
+      .dashboard-title{font-size:16px}
+      .auditor-shell{padding:8px 8px 24px}
+      .grid.two{grid-template-columns:1fr}
+    }
   </style>
 </head>
 <body>

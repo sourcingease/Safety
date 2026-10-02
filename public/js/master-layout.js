@@ -671,9 +671,11 @@ window.renderMasterHeader = function(opts){
             ['search','🔍','Search Applicants','/hr/search-applicants.html'],
             ['shortlist','⭐','Shortlisted','/hr/shortlisted.html'],
             ['addemp','➕','Add New Employee','/hr/index.html'],
-            ['gensalary','💵','Generate Salary','/hr/generate-salary.html'],
-            ['attendance','🕒','Attendance','/hr/attendance.html'],
-            ['advance','💳','Advance Salary','/hr/advance-salary.html']
+            // These three live as tabs inside /hr/index.html (there are no separate pages)
+            ['gensalary','💵','Generate Salary','/hr/index.html?tab=payroll'],
+            ['attendance','🕒','Attendance','/hr/index.html?tab=attendance'],
+            ['advance','💳','Advance Salary','/hr/index.html?tab=advance-salary'],
+            ['taxes','🧾','Taxes','/hr/index.html?tab=taxes']
           ];
           
           // Detect current page from iframe URL
@@ -1120,6 +1122,18 @@ window.renderMasterHeader = function(opts){
     badge.addEventListener('click', (e)=>{ e.preventDefault(); e.stopPropagation(); menu.classList.toggle('open'); });
     document.addEventListener('click', (e)=>{ if(!menu.contains(e.target) && !badge.contains(e.target)) menu.classList.remove('open'); });
     const so = document.getElementById('mlSignOut'); if(so){ so.onclick = function(){ fetch('/api/auth/logout',{method:'POST',credentials:'include'}).finally(()=>{ location.href='/login';}); }; }
+    // Replace the placeholder identity with the signed-in user
+    fetch('/api/auth/me',{credentials:'include'}).then(r=>r.ok?r.json():null).then(function(j){
+      const u = j && j.data && j.data.user; if(!u) return;
+      const name = u.FullName || u.Email || '';
+      const initials = name.split(/[\s@._-]+/).filter(Boolean).slice(0,2).map(function(w){ return w[0].toUpperCase(); }).join('') || '?';
+      const roles = (j.data.roles || []).join(', ');
+      badge.textContent = initials; badge.title = name;
+      menu.querySelector('.avatar').textContent = initials;
+      menu.querySelector('.name').textContent = name;
+      menu.querySelector('.role').textContent = roles || 'USER';
+      menu.querySelector('.company').textContent = u.Email || '';
+    }).catch(function(){});
   }
 };
 

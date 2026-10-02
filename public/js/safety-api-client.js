@@ -666,6 +666,53 @@ function populateForm(formElement, data) {
   });
 }
 
+// ==================== ATTACHMENT LINKS ====================
+
+// Attachments are stored inline as data: URLs, and browsers refuse to open a
+// data: URL in a new tab. Convert it to a Blob URL on click so it opens
+// normally (images/PDFs display, other types download).
+function dataUrlToBlobUrl(dataUrl) {
+  const comma = dataUrl.indexOf(',');
+  const meta = dataUrl.slice(5, comma); // e.g. "image/jpeg;base64"
+  const isBase64 = /;base64$/i.test(meta);
+  const mime = meta.replace(/;base64$/i, '') || 'application/octet-stream';
+  const payload = dataUrl.slice(comma + 1);
+  let bytes;
+  if (isBase64) {
+    const bin = atob(payload);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } else {
+    bytes = new TextEncoder().encode(decodeURIComponent(payload));
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: mime }));
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('click', function (e) {
+    const a = e.target && e.target.closest ? e.target.closest('a[href^="data:"]') : null;
+    if (!a) return;
+    e.preventDefault();
+    try {
+      const url = dataUrlToBlobUrl(a.getAttribute('href'));
+      const w = window.open(url, '_blank');
+      if (!w) {
+        // Popup blocked: fall back to downloading the file
+        const dl = document.createElement('a');
+        dl.href = url;
+        dl.download = (a.textContent || 'attachment').trim();
+        document.body.appendChild(dl);
+        dl.click();
+        dl.remove();
+      }
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (err) {
+      console.error('Could not open attachment', err);
+      alert('Could not open this attachment.');
+    }
+  });
+}
+
 // ==================== EXPORTS ====================
 
 // Make all functions available globally (for use in HTML onclick handlers)

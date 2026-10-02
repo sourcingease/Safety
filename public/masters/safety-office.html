@@ -8461,10 +8461,11 @@ As per UL Fire Test file Rated fire list by UL recognized fire rated certificati
     function resetForm(formId) {
       const form = document.getElementById(formId);
       form.reset();
-      // Reset radio buttons to default (first option or none)
+      // Reset radio buttons, then fall back to the N/A default
       form.querySelectorAll('input[type="radio"]').forEach(radio => {
         radio.checked = false;
       });
+      if (window.defaultAllRadioGroupsToNA) window.defaultAllRadioGroupsToNA(form);
     }
 
     // ==================== DYNAMIC CHECKLIST MANAGEMENT ====================
@@ -11699,6 +11700,53 @@ As per UL Fire Test file Rated fire list by UL recognized fire rated certificati
         showToast('Error loading grievance details.', 'info');
       }
     }
+
+    // Page-wide default: every radio group that offers N/A and has nothing
+    // selected gets N/A. Covers all tabs, forms copied into the working pane,
+    // checklist rows added later, and forms after resetForm(). Saved answers
+    // still win because SafetyAPI.populateForm checks them afterwards.
+    function defaultAllRadioGroupsToNA(root) {
+      root = root || document;
+      // Radios only form a group within the same <form> owner (or no form), so key by owner + name
+      const byOwner = new Map();
+      root.querySelectorAll('input[type="radio"][name]').forEach(r => {
+        let byName = byOwner.get(r.form);
+        if (!byName) { byName = new Map(); byOwner.set(r.form, byName); }
+        if (!byName.has(r.name)) {
+          const scope = r.form || document;
+          byName.set(r.name, Array.from(scope.querySelectorAll('input[type="radio"]'))
+            .filter(x => x.name === r.name && x.form === r.form));
+        }
+      });
+      const groups = [];
+      byOwner.forEach(byName => byName.forEach(list => groups.push(list)));
+      groups.forEach(list => {
+        if (list.some(r => r.checked)) return;
+        const na = list.find(r => ['N/A', 'NA'].includes((r.value || '').trim().toUpperCase()));
+        if (na) na.checked = true;
+      });
+    }
+    window.defaultAllRadioGroupsToNA = defaultAllRadioGroupsToNA;
+    (function watchForNewRadios() {
+      let pending = false;
+      function schedule() {
+        if (pending) return;
+        pending = true;
+        setTimeout(() => { pending = false; defaultAllRadioGroupsToNA(document); }, 0);
+      }
+      new MutationObserver(muts => {
+        for (const m of muts) {
+          for (const n of m.addedNodes) {
+            if (n.nodeType === 1 && (n.matches('input[type="radio"]') || n.querySelector('input[type="radio"]'))) {
+              schedule();
+              return;
+            }
+          }
+        }
+      }).observe(document.documentElement, { childList: true, subtree: true });
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', schedule);
+      else schedule();
+    })();
 
     // Set N/A as default for all radio buttons in a form
     function setDefaultRadioButtons(formId) {

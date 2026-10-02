@@ -31,6 +31,30 @@
 .audit-row.no-issue .issue-cell>*{opacity:.3;pointer-events:none}
     .att-links{margin-top:4px;display:flex;flex-wrap:wrap;gap:4px}
     .audit-footer{margin-top:16px;padding-top:8px;border-top:1px solid #e2e8f0;font-size:12px;color:#64748b;display:flex;justify-content:space-between;flex-wrap:wrap}
+    /* Top app header (master-layout injects its icon toolbar into .header-right) */
+    .dashboard-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin:8px 12px 4px 12px;padding:12px 20px;background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.1);border-bottom:3px solid #0ea5e9}
+    .header-left{display:flex;align-items:center;gap:12px;min-width:0}
+    .logo-small{max-height:40px;width:auto}
+    .dashboard-title{font-size:18px;font-weight:700;letter-spacing:-0.02em}
+    .dashboard-header .header-right{flex-wrap:wrap;position:relative}
+    .header{flex-wrap:wrap;gap:12px}
+    .header .header-right{flex-wrap:wrap}
+    /* Per-issue status */
+    .st-pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;text-transform:uppercase}
+    .st-open{background:#fee2e2;color:#b91c1c}
+    .st-closed{background:#dcfce7;color:#166534}
+    .st-controls{display:flex;flex-direction:column;gap:4px;margin-top:6px;min-width:110px}
+    .st-controls select{padding:5px 6px;border-radius:6px;border:1px solid #e2e8f0;font:inherit;font-size:12px}
+    .st-btn{padding:5px 10px;font-size:12px}
+    /* 12-column sheet: scroll horizontally inside the card instead of spilling out of it */
+    .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+    .table-wrap table{min-width:1100px}
+    .table-wrap input[type="file"]{max-width:100%;font-size:12px}
+    @media (max-width:768px){
+      .dashboard-header{flex-direction:column;align-items:flex-start}
+      .dashboard-title{font-size:16px}
+      .shell{padding:12px 8px 24px}
+    }
   </style>
 </head>
 <body>
@@ -40,13 +64,18 @@
     // the parent will pass embedded=1 and provide the master header itself.
     // In that case hide this local header to avoid double headers.
     (function(){
-      try{
-        const p = new URLSearchParams(location.search||'');
-        if(p.get('embedded') === '1'){
-          const h = document.getElementById('hdr');
-          if(h) h.style.display = 'none';
-        }
-      }catch(e){}
+      function hideIfEmbedded(){
+        try{
+          const p = new URLSearchParams(location.search||'');
+          if(p.get('embedded') === '1'){
+            const h = document.getElementById('hdr');
+            if(h) h.style.display = 'none';
+          }
+        }catch(e){}
+      }
+      // The header is below this script, so wait until it has been parsed
+      if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', hideIfEmbedded);
+      else hideIfEmbedded();
     })();
   </script>
   <div class="dashboard-header" id="hdr">
@@ -68,6 +97,7 @@
     </div>
 
     <div class="card">
+      <div class="table-wrap">
       <table>
         <thead>
           <tr>
@@ -89,6 +119,7 @@
           <tr><td colspan="12" style="text-align:center;padding:14px;color:#94a3b8">Loading...</td></tr>
         </tbody>
       </table>
+      </div>
       <div class="muted">Heads and Values come from the Safety Officer checklist. As auditor, mark issues and record actions.</div>
     </div>
     <div class="audit-footer">
@@ -112,6 +143,50 @@
     function goBack(){
       if(history.length>1){ history.back(); }
       else{ window.location.href = '/masters/safety-auditor.html?embedded=1'; }
+    }
+
+    // Per-issue status: lets the auditor close (or reopen) one issue at a time.
+    // Closing the last open issue closes the whole audit on the server.
+    function statusCellHtml(it, hasIssue, ca){
+      const status = ca && ca.Status ? ca.Status : '';
+      const pill = status ? `<span class="st-pill st-${esc(status.toLowerCase())}">${esc(status)}</span>` : '';
+      if(!hasIssue || !it.Id) return pill;
+      return `${pill || '<span class="st-pill st-open">Open</span>'}
+        <div class="st-controls">
+          <select data-status-for="${it.Id}">
+            <option value="Open" ${status !== 'Closed' ? 'selected' : ''}>Open</option>
+            <option value="Closed" ${status === 'Closed' ? 'selected' : ''}>Closed</option>
+          </select>
+          <button type="button" class="btn st-btn" onclick="setItemStatus(${it.Id})">Update</button>
+        </div>`;
+    }
+
+    async function setItemStatus(itemId){
+      if(!currentAudit || !currentAudit.Id) return;
+      const sel = document.querySelector(`select[data-status-for="${itemId}"]`);
+      const status = sel ? sel.value : 'Closed';
+      // Carry the latest corrective details forward so the newest record stays complete
+      const ca = currentCorrectiveByItem[itemId] || {};
+      const payload = {
+        correctiveActionTaken: ca.CorrectiveActionTaken || null,
+        attachments: ca.Attachments || null,
+        correctiveActionBy: ca.CorrectiveActionBy || null,
+        correctiveActionOn: ca.CorrectiveActionOn || null,
+        resolutionMode: ca.ResolutionMode || null,
+        resolutionAmount: ca.ResolutionAmount != null ? ca.ResolutionAmount : null,
+        status
+      };
+      try{
+        const res = await SafetyAPI.submitCorrectiveAction(currentAudit.Id, itemId, payload);
+        if(!res || !res.statusSaved){
+          alert('Status was not changed: only a Safety Auditor can change issue status.');
+        }else if(res.auditStatus === 'Closed'){
+          alert('Issue ' + status.toLowerCase() + '. All issues are now closed, so the audit is Closed.');
+        }
+        await loadAudit();
+      }catch(e){
+        alert('Failed to update status: ' + (e && e.message ? e.message : e));
+      }
     }
 
     function onNoIssueToggle(cb){
@@ -252,6 +327,7 @@
           const hasIssue = (it.NoIssue === false) || (it.IssueDetails && it.IssueDetails.trim()!=='');
           const noIssue = !hasIssue; // DB stores NoIssue=true when no problem
           tr.className = 'audit-row ' + (noIssue ? 'no-issue' : 'has-issue');
+          if (it.Id) tr.dataset.itemId = it.Id;
           const head = esc(it.Head || '');
           const val = esc(it.Value || '');
           const issue = esc(it.IssueDetails || '');
@@ -315,7 +391,7 @@
             <td class="issue-cell"><div>${caBy}</div></td>
             <td class="issue-cell"><div>${caDate}</div></td>
             <td class="issue-cell"><div>${caAmount}</div></td>
-            <td class="issue-cell"><div>${caStatus ? esc(caStatus) : ''}</div></td>
+            <td class="status-cell">${statusCellHtml(it, hasIssue, ca)}</td>
           `;
           body.appendChild(tr);
         });
@@ -340,6 +416,9 @@
         const suggEl = tr.querySelector('textarea[data-k="SuggestedAction"]');
         const infEl = tr.querySelector('input[data-k="InformedTo"]');
         const m = {
+          // Send the item id so the server updates the row in place and its
+          // corrective actions stay linked to it
+          Id: tr.dataset.itemId ? parseInt(tr.dataset.itemId, 10) : undefined,
           Head: headEl.textContent.trim(),
           Value: valEl ? valEl.textContent.trim() : '',
           NoIssue: noIssueCb ? noIssueCb.checked : true,

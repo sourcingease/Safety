@@ -23,6 +23,23 @@
     table{width:100%;border-collapse:collapse}
     th,td{padding:8px;border-bottom:1px solid #e2e8f0;text-align:left}
     th{background:#f8fafc;text-transform:uppercase;font-size:12px;color:#475569}
+    /* Tax setup */
+    .tax-banner{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;padding:14px 16px;border-radius:12px;margin-bottom:12px;border:1px solid #fecaca;background:#fef2f2;color:#7f1d1d}
+    .tax-banner.warning{border-color:#fde68a;background:#fffbeb;color:#78350f}
+    .tax-banner-icon{font-size:22px;line-height:1}
+    .tax-banner-title{font-weight:700;margin-bottom:2px}
+    .tax-banner-note{font-size:12px;margin-top:6px;opacity:.9}
+    .tax-profile{border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .tax-pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
+    .tax-pill.ok{background:#dcfce7;color:#166534}
+    .tax-pill.bad{background:#fee2e2;color:#b91c1c}
+    .tax-pill.off{background:#e5e7eb;color:#374151}
+    .tax-rule{border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin-bottom:10px;background:#f8fafc}
+    .tax-rule .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;align-items:end}
+    .tax-rule input,.tax-rule select,#taxEditor input,#taxEditor select,#taxEditor textarea{width:100%;box-sizing:border-box}
+    .slab-table td,.slab-table th{padding:4px 6px}
+    .slab-table input{width:100%;box-sizing:border-box}
+    .muted{color:#64748b;font-size:12px}
   </style>
 </head>
 <body>
@@ -32,6 +49,16 @@
     <div class="header-right"></div>
   </div>
   <div class="shell">
+    <!-- Tax setup warning for HR (filled by loadTaxStatus) -->
+    <div id="taxBanner" class="tax-banner" style="display:none" role="alert">
+      <div class="tax-banner-icon">⚠️</div>
+      <div style="flex:1;min-width:0">
+        <div class="tax-banner-title">Payroll tax setup</div>
+        <div id="taxBannerMsg"></div>
+        <div class="tax-banner-note">Tax laws differ by country and change every year. HR is responsible for keeping the tax rules in this system and the payroll process correct and up to date. Verify every rate against the official tax authority's tables.</div>
+      </div>
+      <button class="ct" type="button" onclick="showTab('taxes')">Open tax setup</button>
+    </div>
     <div class="card">
       <div class="icons">
         <a href="/hr/job-posting.html?embedded=1"><span>📝</span> Job Posting</a>
@@ -45,6 +72,7 @@
           <button id="tab-main" class="active" onclick="showTab('main')">Add New Employee</button>
           <button id="tab-totals" onclick="showTab('totals')">Totals</button>
           <button id="tab-paydetails" onclick="showTab('paydetails')">Payroll Details</button>
+          <button id="tab-taxes" onclick="showTab('taxes')">Taxes</button>
         </div>
         <div style="margin-left:auto;flex:0 0 auto">
           <button class="ct primary" type="button" onclick="saveEmployeeAll()">Save</button>
@@ -208,17 +236,62 @@
               <th>Advance Deduction</th>
               <th>Other Deduction</th>
               <th>Net Pay</th>
+              <th>Employer Tax</th>
+              <th>Tax Source</th>
             </tr>
           </thead>
-          <tbody id="payRows"><tr><td colspan="9">Select a payroll month and click Preview Payroll.</td></tr></tbody>
+          <tbody id="payRows"><tr><td colspan="11">Select a payroll month and click Preview Payroll.</td></tr></tbody>
         </table>
-        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+        <div style="display:flex;gap:12px;justify-content:flex-end;align-items:center;flex-wrap:wrap;margin-top:8px">
+          <label style="display:flex;gap:6px;align-items:flex-start;font-size:13px;max-width:560px">
+            <input type="checkbox" id="confirmTaxes" onchange="updateGenerateEnabled()" style="margin-top:3px" />
+            <span>I confirm the tax setup and every employee's tax amounts above are correct for this period and comply with current tax law.</span>
+          </label>
           <button class="ct primary" type="button" id="btnGeneratePayroll" onclick="generatePayroll()" disabled>Generate Payroll &amp; Post to AP</button>
         </div>
       </div>
       <div class="tab-panel" id="panel-attendance" style="display:none">
         <div style="font-weight:700;margin-bottom:6px">Attendance</div>
         <p class="muted">This tab is reserved for employee attendance tracking. Layout and data wiring can be added here later.</p>
+      </div>
+      <div class="tab-panel" id="panel-taxes" style="display:none">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+          <div>
+            <div style="font-weight:700">Payroll Tax Setup</div>
+            <div class="muted">Define the income tax slabs and contributions for your country. Payroll uses the active, verified profile that covers the payroll month. Editing a profile clears its verification.</div>
+          </div>
+          <button class="ct primary" type="button" onclick="editTaxProfile(null)">+ New Tax Profile</button>
+        </div>
+        <div id="taxProfiles"><div class="muted">Loading…</div></div>
+
+        <div id="taxEditor" class="card" style="display:none;margin-top:10px">
+          <div style="font-weight:700;margin-bottom:8px" id="taxEditorTitle">New Tax Profile</div>
+          <div class="grid">
+            <div class="form-group"><label class="form-label">Profile Name *</label><input id="TxName" class="form-input" placeholder="e.g. Pakistan FY 2026-27"/></div>
+            <div class="form-group"><label class="form-label">Country *</label><input id="TxCountry" class="form-input" placeholder="e.g. Pakistan"/></div>
+            <div class="form-group"><label class="form-label">Currency</label><input id="TxCurrency" class="form-input" placeholder="e.g. PKR"/></div>
+            <div class="form-group"><label class="form-label">Effective From *</label><input id="TxFrom" type="date" class="form-input"/></div>
+            <div class="form-group"><label class="form-label">Effective To</label><input id="TxTo" type="date" class="form-input"/></div>
+            <div class="form-group"><label class="form-label">Active</label><div><input id="TxActive" type="checkbox" checked/> Use for payroll</div></div>
+            <div class="form-group" style="grid-column:1/-1"><label class="form-label">Official source (law / tax table reference)</label><input id="TxSource" class="form-input" placeholder="e.g. Finance Act 2026, FBR salary tax table"/></div>
+            <div class="form-group" style="grid-column:1/-1"><label class="form-label">Notes</label><textarea id="TxNotes" class="form-input" rows="2"></textarea></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 6px">
+            <div style="font-weight:700">Tax Rules</div>
+            <button class="ct" type="button" onclick="addTaxRule()">+ Add Rule</button>
+          </div>
+          <div class="muted" style="margin-bottom:8px"><b>Annual slabs</b>: monthly gross × 12 is taxed as fixed amount + rate % of income above the slab's "from", then divided by 12. <b>Percent</b>: rate % of monthly gross (optional wage cap / amount cap). <b>Fixed</b>: a flat monthly amount. <b>Employer</b> rules are company costs and are not deducted from pay.</div>
+          <div id="taxRules"></div>
+          <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-top:6px">
+            <div class="form-group" style="min-width:200px"><label class="form-label">Test with monthly gross</label><input id="TxTestGross" type="number" step="0.01" class="form-input" placeholder="e.g. 150000"/></div>
+            <button class="ct" type="button" onclick="testTaxProfile()">Calculate</button>
+            <div id="TxTestResult" class="muted" style="flex:1;min-width:240px"></div>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+            <button class="ct" type="button" onclick="closeTaxEditor()">Cancel</button>
+            <button class="ct primary" type="button" onclick="saveTaxProfile()">Save Profile</button>
+          </div>
+        </div>
       </div>
       <div class="tab-panel" id="panel-advance" style="display:none">
         <div style="font-weight:700;margin-bottom:6px">Advance Salary</div>
@@ -380,7 +453,7 @@
         if (email && window.EmpEmail) EmpEmail.value = email;
       }catch(e){}
     })();
-    function showTab(id){ ['main','totals','paydetails','payroll','attendance','advance'].forEach(t=>{ var panel=document.getElementById('panel-'+t); var tab=document.getElementById('tab-'+t); if(panel) panel.style.display = (t===id)?'block':'none'; if(tab) tab.classList.toggle('active', t===id); }); }
+    function showTab(id){ if(id==='taxes' && typeof loadTaxProfiles==='function') loadTaxProfiles(); ['main','totals','paydetails','payroll','attendance','advance','taxes'].forEach(t=>{ var panel=document.getElementById('panel-'+t); var tab=document.getElementById('tab-'+t); if(panel) panel.style.display = (t===id)?'block':'none'; if(tab) tab.classList.toggle('active', t===id); }); }
 
     // Allow deep linking to specific HR tabs, e.g. ?tab=payroll or ?tab=salary
     (function(){
@@ -389,7 +462,7 @@
         const tabRaw = (url.searchParams.get('tab') || '');
         const tab = tabRaw.toLowerCase();
         const isEmbedded = url.searchParams.get('embedded') === '1';
-        if(tab === 'totals' || tab === 'payroll' || tab === 'salary' || tab === 'paydetails' || tab === 'payroll-details' || tab === 'attendance' || tab === 'advance' || tab === 'advance-salary'){
+        if(tab === 'totals' || tab === 'payroll' || tab === 'salary' || tab === 'paydetails' || tab === 'payroll-details' || tab === 'attendance' || tab === 'advance' || tab === 'advance-salary' || tab === 'taxes'){
           if(tab === 'salary'){
             showTab('payroll');
           } else if(tab === 'payroll-details'){
@@ -666,35 +739,55 @@
       const tbody=document.getElementById('payRows');
       if(!tbody) return;
       if(!payrollPreview.length){
-        tbody.innerHTML='<tr><td colspan="9">No payroll rows for this period.</td></tr>';
+        tbody.innerHTML='<tr><td colspan="11">No payroll rows for this period.</td></tr>';
         return;
       }
+      const sourceLabel = { profile:'Tax profile', manual:'Manual override', none:'⚠️ None' };
       tbody.innerHTML=payrollPreview.map(r=>`
         <tr>
-          <td>${r.EmployeeName||''}</td>
+          <td>${escHtml(r.EmployeeName||'')}</td>
           <td>${r.BasicSalary!=null?r.BasicSalary:''}</td>
-          <td>${r.Tax!=null?r.Tax:''}</td>
+          <td title="${escHtml((r.TaxLines||[]).map(l=>l.name+': '+l.amount+' ('+l.payer+')').join('\n'))}">${r.Tax!=null?r.Tax:''}</td>
           <td>${r.Fica!=null?r.Fica:''}</td>
           <td>${r.AbsentDays!=null?r.AbsentDays:''}</td>
           <td>${r.AbsentDeduction!=null?r.AbsentDeduction:''}</td>
           <td>${r.AdvanceDeduction!=null?r.AdvanceDeduction:''}</td>
           <td>${r.OtherDeduction!=null?r.OtherDeduction:''}</td>
           <td>${r.NetPay!=null?r.NetPay:''}</td>
+          <td>${r.EmployerTaxCost!=null?r.EmployerTaxCost:''}</td>
+          <td>${sourceLabel[r.TaxSource]||''}</td>
         </tr>`).join('');
     }
 
-    async function loadPayrollPreview(){
-      const monthEl=document.getElementById('PayMonth');
-      const yearEl=document.getElementById('PayYear');
+    function escHtml(s){ return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+    function selectedPeriod(){
+      const m=document.getElementById('PayMonth'), y=document.getElementById('PayYear');
+      return (m && y && m.value && y.value) ? (y.value + '-' + m.value) : null;
+    }
+
+    // Payroll can only be generated with a ready (verified) tax setup, a
+    // preview loaded, and HR's explicit confirmation for this period.
+    var payrollTaxReady=false;
+    function updateGenerateEnabled(){
       const btn=document.getElementById('btnGeneratePayroll');
-      if(btn) btn.disabled=true;
-      if(!monthEl || !yearEl || !monthEl.value || !yearEl.value){ alert('Select payroll month and year first'); return; }
-      const period = yearEl.value + '-' + monthEl.value; // e.g. 2026-01
+      const cb=document.getElementById('confirmTaxes');
+      if(cb) cb.disabled = !payrollTaxReady;
+      if(btn) btn.disabled = !(payrollTaxReady && payrollPreview.length && cb && cb.checked);
+    }
+
+    async function loadPayrollPreview(){
+      const cb=document.getElementById('confirmTaxes'); if(cb) cb.checked=false;
+      payrollTaxReady=false; updateGenerateEnabled();
+      const period = selectedPeriod();
+      if(!period){ alert('Select payroll month and year first'); return; }
       try{
         const r=await j('/api/hr/payroll/preview?period='+encodeURIComponent(period));
         payrollPreview=(r.data||[]);
         renderPayrollPreview();
-        if(btn && payrollPreview.length) btn.disabled=false;
+        showTaxBanner(r.taxStatus);
+        payrollTaxReady = !!(r.taxStatus && r.taxStatus.ready);
+        updateGenerateEnabled();
       }catch(e){
         console.error(e);
         alert('Failed to load payroll preview');
@@ -702,16 +795,179 @@
     }
 
     async function generatePayroll(){
-      const monthEl=document.getElementById('PayMonth');
-      const yearEl=document.getElementById('PayYear');
-      if(!monthEl || !yearEl || !monthEl.value || !yearEl.value){ alert('Select payroll month and year first'); return; }
+      const period = selectedPeriod();
+      if(!period){ alert('Select payroll month and year first'); return; }
       if(!payrollPreview.length){ alert('Load a payroll preview before generating.'); return; }
-      const period = yearEl.value + '-' + monthEl.value;
+      if(!document.getElementById('confirmTaxes')?.checked){ alert('Confirm the tax setup for this period first.'); return; }
       try{
-        await j('/api/hr/payroll/generate',{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ period }) });
-        alert('Payroll generated and posted to AP (Accounts Payable) if configured on server.');
+        const r=await fetch('/api/hr/payroll/generate',{ method:'POST', credentials:'include', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ period, confirmTaxes:true }) });
+        const data=await r.json().catch(()=>({}));
+        if(!r.ok || data.success===false){ alert(data.error || 'Failed to generate payroll'); return; }
+        alert('Payroll generated and posted to AP (Accounts Payable): ' + (data.count||0) + ' employee(s).');
       }catch(e){ console.error(e); alert('Failed to generate payroll'); }
     }
+
+    // --- Tax setup warning ---
+    function showTaxBanner(st){
+      const el=document.getElementById('taxBanner'); if(!el || !st) return;
+      document.getElementById('taxBannerMsg').textContent = st.message || '';
+      el.classList.toggle('warning', !!st.ready);
+      el.style.display='flex';
+    }
+    async function loadTaxStatus(){
+      try{
+        const r=await j('/api/hr/tax-status?period='+encodeURIComponent(selectedPeriod() || new Date().toISOString().slice(0,7)));
+        showTaxBanner(r.data);
+      }catch(e){ /* not signed in or HR not enabled */ }
+    }
+
+    // --- Tax setup (Taxes tab) ---
+    var taxProfiles=[]; var editingTaxId=null; // var: the ?tab=taxes deep link can run before this line
+
+    async function loadTaxProfiles(){
+      const box=document.getElementById('taxProfiles'); if(!box) return;
+      try{
+        const r=await j('/api/hr/tax-profiles');
+        taxProfiles=r.data||[];
+        if(!taxProfiles.length){ box.innerHTML='<div class="muted">No tax profiles yet. Click “New Tax Profile” to set up your country\'s payroll taxes.</div>'; return; }
+        box.innerHTML=taxProfiles.map(p=>{
+          const verified = p.verified_at ? `<span class="tax-pill ok">Verified by ${escHtml(p.verified_by_name||'HR')} · ${new Date(p.verified_at).toLocaleDateString()}</span>` : '<span class="tax-pill bad">Not verified</span>';
+          const active = p.is_active ? '' : '<span class="tax-pill off">Inactive</span>';
+          return `<div class="tax-profile">
+            <div style="flex:1;min-width:220px">
+              <div style="font-weight:700">${escHtml(p.name)} <span class="muted">· ${escHtml(p.country)}${p.currency?' · '+escHtml(p.currency):''}</span></div>
+              <div class="muted">${escHtml(p.effective_from)} → ${escHtml(p.effective_to||'open')} · ${(p.rules||[]).length} rule(s)${p.source_reference?' · Source: '+escHtml(p.source_reference):''}</div>
+            </div>
+            ${verified} ${active}
+            <button class="ct" type="button" onclick="editTaxProfile(${p.id})">Edit</button>
+            ${p.verified_at ? '' : `<button class="ct primary" type="button" onclick="verifyTaxProfile(${p.id})">Verify</button>`}
+            <button class="ct" type="button" onclick="deleteTaxProfile(${p.id})">Delete</button>
+          </div>`;
+        }).join('');
+      }catch(e){ box.innerHTML='<div class="muted">Could not load tax profiles.</div>'; }
+    }
+
+    function slabRowHtml(s){
+      s=s||{};
+      return `<tr>
+        <td><input type="number" step="0.01" data-s="from" value="${s.from??''}" placeholder="0"/></td>
+        <td><input type="number" step="0.01" data-s="to" value="${s.to??''}" placeholder="no limit"/></td>
+        <td><input type="number" step="0.01" data-s="fixed" value="${s.fixed??''}" placeholder="0"/></td>
+        <td><input type="number" step="0.0001" data-s="rate" value="${s.rate??''}" placeholder="0"/></td>
+        <td><button class="ct" type="button" onclick="this.closest('tr').remove()">✕</button></td>
+      </tr>`;
+    }
+
+    function addTaxRule(rule){
+      rule=rule||{ method:'annual_slabs', category:'income_tax', payer:'employee' };
+      const div=document.createElement('div'); div.className='tax-rule';
+      div.innerHTML=`
+        <div class="row">
+          <div><label class="form-label">Rule name *</label><input data-r="name" class="form-input" value="${escHtml(rule.name||'')}" placeholder="e.g. Income tax"/></div>
+          <div><label class="form-label">Category</label><select data-r="category" class="form-select">
+            <option value="income_tax">Income tax</option><option value="social_security">Social security / pension</option><option value="other">Other</option></select></div>
+          <div><label class="form-label">Paid by</label><select data-r="payer" class="form-select">
+            <option value="employee">Employee (deducted)</option><option value="employer">Employer (company cost)</option></select></div>
+          <div><label class="form-label">Method</label><select data-r="method" class="form-select" onchange="toggleRuleMethod(this.closest('.tax-rule'))">
+            <option value="annual_slabs">Annual slabs</option><option value="percent">Percent of gross</option><option value="fixed">Fixed monthly</option></select></div>
+          <div style="text-align:right"><button class="ct" type="button" onclick="this.closest('.tax-rule').remove()">Remove rule</button></div>
+        </div>
+        <div class="row m-percent" style="margin-top:8px">
+          <div><label class="form-label">Rate %</label><input data-r="rate" type="number" step="0.0001" class="form-input" value="${rule.rate??''}"/></div>
+          <div><label class="form-label">Max monthly wage (optional)</label><input data-r="baseCap" type="number" step="0.01" class="form-input" value="${rule.base_cap??''}"/></div>
+          <div><label class="form-label">Max monthly amount (optional)</label><input data-r="amountCap" type="number" step="0.01" class="form-input" value="${rule.amount_cap??''}"/></div>
+        </div>
+        <div class="row m-fixed" style="margin-top:8px">
+          <div><label class="form-label">Monthly amount</label><input data-r="fixedAmount" type="number" step="0.01" class="form-input" value="${rule.fixed_amount??''}"/></div>
+        </div>
+        <div class="m-slabs" style="margin-top:8px">
+          <table class="slab-table"><thead><tr><th>Annual income from</th><th>To (blank = no limit)</th><th>Fixed tax</th><th>Rate % on excess over "from"</th><th></th></tr></thead>
+            <tbody>${(rule.slabs&&rule.slabs.length?rule.slabs:[{}]).map(slabRowHtml).join('')}</tbody></table>
+          <button class="ct" type="button" style="margin-top:4px" onclick="this.previousElementSibling.querySelector('tbody').insertAdjacentHTML('beforeend', slabRowHtml())">+ Add slab</button>
+        </div>`;
+      div.querySelector('[data-r="category"]').value=rule.category||'income_tax';
+      div.querySelector('[data-r="payer"]').value=rule.payer||'employee';
+      div.querySelector('[data-r="method"]').value=rule.method||'annual_slabs';
+      document.getElementById('taxRules').appendChild(div);
+      toggleRuleMethod(div);
+    }
+
+    function toggleRuleMethod(div){
+      const m=div.querySelector('[data-r="method"]').value;
+      div.querySelector('.m-percent').style.display = m==='percent'?'grid':'none';
+      div.querySelector('.m-fixed').style.display = m==='fixed'?'grid':'none';
+      div.querySelector('.m-slabs').style.display = m==='annual_slabs'?'block':'none';
+    }
+
+    function readTaxRules(){
+      return Array.from(document.querySelectorAll('#taxRules .tax-rule')).map(div=>{
+        const g=k=>{ const el=div.querySelector(`[data-r="${k}"]`); return el?el.value:''; };
+        const slabs=Array.from(div.querySelectorAll('.slab-table tbody tr')).map(tr=>{
+          const s={}; tr.querySelectorAll('[data-s]').forEach(i=>{ s[i.dataset.s]=i.value===''?null:Number(i.value); }); return s;
+        }).filter(s=>s.from!=null || s.to!=null || s.fixed!=null || s.rate!=null);
+        return { name:g('name').trim(), category:g('category'), payer:g('payer'), method:g('method'),
+          rate:g('rate'), baseCap:g('baseCap'), amountCap:g('amountCap'), fixedAmount:g('fixedAmount'), slabs };
+      });
+    }
+
+    function editTaxProfile(id){
+      editingTaxId=id;
+      const p = id ? taxProfiles.find(x=>x.id===id) : null;
+      document.getElementById('taxEditorTitle').textContent = p ? 'Edit Tax Profile' : 'New Tax Profile';
+      const set=(k,v)=>{ const el=document.getElementById(k); if(el) el.value = v==null?'':v; };
+      set('TxName',p&&p.name); set('TxCountry',p&&p.country); set('TxCurrency',p&&p.currency);
+      set('TxFrom',p&&p.effective_from); set('TxTo',p&&p.effective_to);
+      set('TxSource',p&&p.source_reference); set('TxNotes',p&&p.notes);
+      document.getElementById('TxActive').checked = p ? !!p.is_active : true;
+      document.getElementById('taxRules').innerHTML='';
+      (p && p.rules && p.rules.length ? p.rules : [null]).forEach(r=>addTaxRule(r||undefined));
+      document.getElementById('TxTestResult').textContent='';
+      const ed=document.getElementById('taxEditor'); ed.style.display='block'; ed.scrollIntoView({behavior:'smooth'});
+    }
+    function closeTaxEditor(){ document.getElementById('taxEditor').style.display='none'; editingTaxId=null; }
+
+    async function saveTaxProfile(){
+      const v=k=>(document.getElementById(k)?.value||'').trim();
+      const body={ name:v('TxName'), country:v('TxCountry'), currency:v('TxCurrency'), effectiveFrom:v('TxFrom'), effectiveTo:v('TxTo'),
+        isActive:document.getElementById('TxActive').checked, sourceReference:v('TxSource'), notes:v('TxNotes'), rules:readTaxRules() };
+      const r=await fetch(editingTaxId?('/api/hr/tax-profiles/'+editingTaxId):'/api/hr/tax-profiles',{ method:editingTaxId?'PUT':'POST', credentials:'include', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+      const data=await r.json().catch(()=>({}));
+      if(!r.ok || data.success===false){ alert((data.errors||[data.error||'Failed to save']).join('\n')); return; }
+      alert('Tax profile saved. Review every rate against the official tax tables, then click Verify — payroll cannot use an unverified profile.');
+      closeTaxEditor(); await loadTaxProfiles(); loadTaxStatus();
+    }
+
+    async function verifyTaxProfile(id){
+      const p=taxProfiles.find(x=>x.id===id);
+      if(!confirm(`Verify "${p?p.name:'this profile'}"?\n\nBy verifying, you confirm every rate, slab and contribution matches the current official tax law for ${p?p.country:'this country'}, and that payroll processes are set up accordingly.`)) return;
+      const r=await fetch('/api/hr/tax-profiles/'+id+'/verify',{ method:'POST', credentials:'include' });
+      const data=await r.json().catch(()=>({}));
+      if(!r.ok || data.success===false){ alert(data.error||'Failed to verify'); return; }
+      await loadTaxProfiles(); loadTaxStatus();
+    }
+
+    async function deleteTaxProfile(id){
+      if(!confirm('Delete this tax profile? Payroll periods it covers will have no tax setup.')) return;
+      const r=await fetch('/api/hr/tax-profiles/'+id,{ method:'DELETE', credentials:'include' });
+      const data=await r.json().catch(()=>({}));
+      if(!r.ok || data.success===false){ alert(data.error||'Failed to delete'); return; }
+      await loadTaxProfiles(); loadTaxStatus();
+    }
+
+    async function testTaxProfile(){
+      const gross=Number(document.getElementById('TxTestGross').value||0);
+      const out=document.getElementById('TxTestResult');
+      try{
+        const r=await j('/api/hr/tax-profiles/calculate',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ monthlyGross:gross, rules:readTaxRules() }) });
+        const d=r.data||{};
+        out.innerHTML=(d.lines||[]).map(l=>`${escHtml(l.name)} (${escHtml(l.payer)}): <b>${l.amount}</b>`).join(' · ') +
+          `<br/>Employee deductions: <b>${(d.incomeTax+d.socialSecurity+d.otherEmployee).toFixed(2)}</b> · Net: <b>${(gross-d.incomeTax-d.socialSecurity-d.otherEmployee).toFixed(2)}</b> · Employer cost: <b>${d.employerCost}</b>`;
+      }catch(e){ out.textContent='Calculation failed'; }
+    }
+
+    document.getElementById('PayMonth')?.addEventListener('change', loadTaxStatus);
+    document.getElementById('PayYear')?.addEventListener('change', loadTaxStatus);
+    loadTaxStatus();
 
     loadEmployees();
   </script>

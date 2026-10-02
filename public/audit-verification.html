@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Safety Audits â€¢ Verification Sheet</title>
+  <title>Safety Audits • Verification Sheet</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico" />
   <link rel="stylesheet" href="/app.css" />
   <style>
@@ -65,6 +65,43 @@
     .footer-bar { margin-top:18px; display:flex; justify-content:flex-end; }
     .btn-primary { padding:10px 18px; border-radius:8px; border:0; background:#0ea5e9; color:#fff; font-weight:600; cursor:pointer; }
     .btn-primary:hover { background:#0284c7; }
+
+    /* Keep header, toolbar and the 12-column table inside the viewport */
+    .logo-small { max-height:40px; width:auto; }
+    .dashboard-header { flex-wrap:wrap; gap:12px; }
+    .header-left { min-width:0; }
+    .header-right { flex-wrap:wrap; }
+    .top-bar, .toolbar { flex-wrap:wrap; gap:12px; }
+
+    /* Use the full screen width for the 12-column sheet */
+    .shell { max-width:none; padding:16px 20px 32px; }
+    /* The table scrolls inside its own box that fits the screen, so both
+       scrollbars are always reachable and the column headings stay visible */
+    .data-table-container { overflow:auto; max-height:calc(100vh - 230px); min-height:300px; border:1px solid #e2e8f0; border-radius:8px; }
+    .data-table-container table { min-width:1400px; }
+    .data-table-container thead th { position:sticky; top:0; z-index:2; background:#f8fafc; box-shadow:0 1px 0 #e2e8f0; }
+    .data-table-container td { vertical-align:top; }
+    .data-table-container::-webkit-scrollbar { width:12px; height:12px; }
+    .data-table-container::-webkit-scrollbar-track { background:#f1f5f9; }
+    .data-table-container::-webkit-scrollbar-thumb { background:#94a3b8; border-radius:6px; border:2px solid #f1f5f9; }
+    .data-table-container::-webkit-scrollbar-thumb:hover { background:#64748b; }
+    .data-table-container { scrollbar-width:auto; scrollbar-color:#94a3b8 #f1f5f9; }
+    /* Give the corrective-action inputs room to be usable */
+    .data-table-container .corrective-textarea { min-width:200px; min-height:60px; }
+    .data-table-container input[id^="resBy_"] { min-width:130px; }
+    .data-table-container input[id^="resOn_"] { min-width:140px; }
+    .data-table-container input[id^="resAmt_"] { min-width:100px; }
+    .data-table-container select[id^="resStatus_"] { min-width:130px; }
+    .data-table-container input[type="file"] { max-width:220px; font-size:12px; }
+    .data-table-container td:nth-child(1) { min-width:200px; }
+    .data-table-container td:nth-child(4), .data-table-container td:nth-child(6) { min-width:160px; }
+    .data-table-container a { word-break:break-all; }
+    @media (max-width:768px){
+      .dashboard-header { flex-direction:column; align-items:flex-start; }
+      .shell { padding:12px 8px 24px; }
+      .data-table-container { max-height:none; }
+      .corrective-form-row { grid-template-columns:1fr; }
+    }
   </style>
 </head>
 <body>
@@ -73,13 +110,18 @@
     // If this page is embedded inside another dashboard (embedded=1),
     // hide the local master header to avoid duplicate headers.
     (function(){
-      try{
-        const p = new URLSearchParams(location.search || '');
-        if(p.get('embedded') === '1'){
-          const hdr = document.getElementById('mlHdr');
-          if(hdr) hdr.remove();
-        }
-      }catch(e){}
+      function hideIfEmbedded(){
+        try{
+          const p = new URLSearchParams(location.search || '');
+          if(p.get('embedded') === '1'){
+            const hdr = document.getElementById('mlHdr');
+            if(hdr) hdr.remove();
+          }
+        }catch(e){}
+      }
+      // The header is below this script, so wait until it has been parsed
+      if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', hideIfEmbedded);
+      else hideIfEmbedded();
     })();
   </script>
   <div class="dashboard-header" id="mlHdr">
@@ -158,9 +200,9 @@
 
     // Check if user has Safety Auditor / Audit Officer role (can change status)
     function canChangeStatus() {
-      // Try to get user role from session/local storage or auth cookie.
+      // Role comes from /api/auth/me (see ensureUserRole); storage is a legacy fallback.
       // IMPORTANT: Only explicit auditor roles are allowed. Everyone else is read-only.
-      const storedRole = sessionStorage.getItem('userRole') || localStorage.getItem('userRole');
+      const storedRole = userRole || sessionStorage.getItem('userRole') || localStorage.getItem('userRole');
       if (storedRole) {
         const roleLower = storedRole.toLowerCase();
         // Allow only Safety Auditor / Audit Officer to change status
@@ -241,7 +283,7 @@
       const parts = trimmed.split(',').map(s => s.trim()).filter(Boolean);
       return parts.map((p) => {
         const isUrl = /^https?:\/\//i.test(p) || p.startsWith('data:');
-        const label = esc(p.length > 60 ? p.slice(0, 57) + 'â€¦' : p);
+        const label = esc(p.length > 60 ? p.slice(0, 57) + '…' : p);
         return isUrl ? `<a href="${esc(p)}" target="_blank">${label}</a>` : `<span>${label}</span>`;
       }).join('<br/>' );
     }
@@ -452,7 +494,20 @@
       container.innerHTML = chunks.join('');
     }
 
+    // Load the signed-in user's role names once, so canChangeStatus() knows who is an auditor
+    async function ensureUserRole() {
+      if (userRole !== null) return;
+      try {
+        const r = await fetch('/api/auth/me', { credentials: 'include' });
+        const j = r.ok ? await r.json() : null;
+        userRole = (j && j.data && Array.isArray(j.data.roles)) ? j.data.roles.join(', ') : '';
+      } catch (e) {
+        userRole = '';
+      }
+    }
+
     async function loadAudit() {
+      await ensureUserRole();
       const titleEl = document.getElementById('auditTitle');
       const metaEl = document.getElementById('auditMeta');
       const tbody = document.getElementById('sheetBody');
@@ -482,7 +537,7 @@
         });
         const code = formatAuditCode(plan);
         titleEl.textContent = `${code} AUDIT`;
-        metaEl.textContent = plan.AuditName ? `${plan.AuditName} â€¢ ${plan.AuditType || ''}` : 'Verification Sheet';
+        metaEl.textContent = plan.AuditName ? `${plan.AuditName} • ${plan.AuditType || ''}` : 'Verification Sheet';
         renderTable(plan);
       } catch (err) {
         console.error(err);

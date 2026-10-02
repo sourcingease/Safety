@@ -498,7 +498,7 @@
         const result = await response.json();
         if (result.success) {
           alert('AR Invoice created successfully! Invoice ID: ' + result.invoiceId);
-          window.open('/accounting/accounts-receivable.html', '_blank');
+          window.open('/accounting/receivables.html', '_blank');
         } else {
           alert('Error: ' + result.error);
         }
@@ -523,7 +523,7 @@
         const result = await response.json();
         if (result.success) {
           alert('AP Invoice created successfully! Invoice ID: ' + result.invoiceId);
-          window.open('/accounting/accounts-payable.html', '_blank');
+          window.open('/accounting/payables.html', '_blank');
         } else {
           alert('Error: ' + result.error);
         }

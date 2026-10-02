@@ -28,6 +28,7 @@ const supabaseCrm = require('./db/supabase-crm');
 const supabaseHr = require('./db/supabase-hr');
 const supabaseAccounting = require('./db/supabase-accounting');
 const supabaseCore = require('./db/supabase-core');
+const supabasePayrollTax = require('./db/supabase-payroll-tax');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -826,8 +827,10 @@ app.get('/api/auth/verify-email', async (req, res) => {
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     let user = null;
+    let roles = [];
     if (ENABLE_SUPABASE_AUTH) {
       user = await supabaseAuth.getUserById(req.auth.uid);
+      if (req.auth.tid) roles = await supabaseAuth.getUserRoleNames(req.auth.uid, req.auth.tid);
     } else {
       const connector = new AzureSQLConnector();
       await connector.connect();
@@ -835,7 +838,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
       await safeDisconnect(connector);
       user = u.recordset[0];
     }
-    res.json({ success: true, data: { user, tenantId: req.auth.tid } });
+    res.json({ success: true, data: { user, roles, tenantId: req.auth.tid } });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
@@ -3977,7 +3980,12 @@ app.put('/api/hr/employees/:id/pay-details', requireAuth, async (req, res)=>{
 // HR Payroll preview based on employee totals (MTD values) and salary details
 // Shared payroll row-shaping logic (basic/tax/fica/net) used by both the
 // Supabase and SQL Server code paths for preview + generate.
-function computePayrollRows(baseRows, period) {
+// Taxes come from the tenant's tax profile (HR > Taxes). Amounts typed into an
+// employee's Totals/Pay Details override the profile for that employee
+// (TaxSource 'manual'). There is no built-in default rate: without a profile
+// nothing is withheld and payroll generation is blocked.
+function computePayrollRows(baseRows, period, taxProfile, taxFlags) {
+  const r2 = n => Math.round((Number(n)||0) * 100) / 100;
   return (baseRows||[]).map(row=>{
     let basic = Number(row.MTD_Gross||0);
     if (!basic && row.Salary) {
@@ -3987,22 +3995,107 @@ function computePayrollRows(baseRows, period) {
       else if (freq === 'bi-weekly') basic = basic / 26 * 12;
       else if (freq === 'weekly') basic = basic / 52 * 12;
     }
-    let tax = Number(row.MTD_State||0) + Number(row.MTD_Federal||0);
-    if (!tax) {
-      tax = Number(row.FederalWithholding||0) + Number(row.StateWithholding||0);
-    }
-    const fica = Number(row.MTD_Fica||0) || (basic * 0.0765);
-    const other = Number(row.MTD_Other||0) || Number(row.Deductions||0);
+    const manualTax = Number(row.MTD_State||0) + Number(row.MTD_Federal||0)
+      || Number(row.FederalWithholding||0) + Number(row.StateWithholding||0);
+    const manualSocial = Number(row.MTD_Fica||0);
+    const calc = supabasePayrollTax.computeEmployeeTaxes(taxProfile, basic, (taxFlags||{})[row.EmployeeId] || {});
+    const tax = manualTax || calc.incomeTax;
+    const fica = manualSocial || calc.socialSecurity;
+    const other = (Number(row.MTD_Other||0) || Number(row.Deductions||0)) + calc.otherEmployee;
     const absentDays = 0, absentDed = 0, advDed = 0;
     const net = basic - tax - fica - other - absentDed - advDed;
     return {
       EmployeeId: row.EmployeeId, EmployeeName: row.EmployeeName, Period: period,
-      BasicSalary: basic, Tax: tax, Fica: fica, AbsentDays: absentDays,
-      AbsentDeduction: absentDed, AdvanceDeduction: advDed, OtherDeduction: other,
-      NetPay: net > 0 ? net : 0
+      BasicSalary: r2(basic), Tax: r2(tax), Fica: r2(fica), AbsentDays: absentDays,
+      AbsentDeduction: absentDed, AdvanceDeduction: advDed, OtherDeduction: r2(other),
+      NetPay: net > 0 ? r2(net) : 0,
+      EmployerTaxCost: calc.employerCost,
+      TaxSource: (manualTax || manualSocial) ? 'manual' : (taxProfile ? 'profile' : 'none'),
+      TaxLines: calc.lines
     };
   });
 }
+
+// First day of a YYYY-MM payroll period, used to pick the tax profile in force
+function periodStartDate(period) {
+  const m = /^(\d{4})-(\d{2})$/.exec(period || '');
+  return m ? `${m[1]}-${m[2]}-01` : null;
+}
+
+async function loadPayrollTaxContext(tenantId, period) {
+  const date = periodStartDate(period);
+  const profile = date ? await supabasePayrollTax.getProfileForDate(tenantId, date) : null;
+  const flags = await supabasePayrollTax.getEmployeeTaxFlags(tenantId);
+  return { profile, flags, status: supabasePayrollTax.taxSetupStatus(profile) };
+}
+
+async function requireHrManage(req, res) {
+  const ok = await supabaseAuth.hasPermission(req.auth.tid, req.auth.uid, 'MODULE_MANAGE_HR');
+  if (!ok) res.status(403).json({ success:false, error:'Only HR managers can change tax setup' });
+  return ok;
+}
+
+// ---- Tax setup (HR > Taxes) ----
+app.get('/api/hr/tax-profiles', requireAuth, async (req, res)=>{
+  try{ res.json({ success:true, data: await supabasePayrollTax.listProfiles(req.auth.tid) }); }
+  catch(e){ res.status(500).json({ success:false, error:e.message }); }
+});
+
+app.get('/api/hr/tax-status', requireAuth, async (req, res)=>{
+  try{
+    const period = (req.query.period || new Date().toISOString().slice(0,7)).toString();
+    const ctx = await loadPayrollTaxContext(req.auth.tid, period);
+    res.json({ success:true, data: { period, profileId: ctx.profile?.id || null, ...ctx.status } });
+  }catch(e){ res.status(500).json({ success:false, error:e.message }); }
+});
+
+app.post('/api/hr/tax-profiles', requireAuth, async (req, res)=>{
+  try{
+    if(!(await requireHrManage(req, res))) return;
+    const errors = supabasePayrollTax.validateProfileInput(req.body||{});
+    if(errors.length) return res.status(400).json({ success:false, error: errors.join('; '), errors });
+    const id = await supabasePayrollTax.saveProfile(req.auth.tid, req.auth.uid, req.body);
+    res.json({ success:true, id });
+  }catch(e){ res.status(e.status||500).json({ success:false, error:e.message }); }
+});
+
+app.put('/api/hr/tax-profiles/:id', requireAuth, async (req, res)=>{
+  try{
+    if(!(await requireHrManage(req, res))) return;
+    const errors = supabasePayrollTax.validateProfileInput(req.body||{});
+    if(errors.length) return res.status(400).json({ success:false, error: errors.join('; '), errors });
+    const id = await supabasePayrollTax.saveProfile(req.auth.tid, req.auth.uid, req.body, parseInt(req.params.id));
+    res.json({ success:true, id, message:'Saved. The profile must be verified again before payroll can use it.' });
+  }catch(e){ res.status(e.status||500).json({ success:false, error:e.message }); }
+});
+
+app.post('/api/hr/tax-profiles/:id/verify', requireAuth, async (req, res)=>{
+  try{
+    if(!(await requireHrManage(req, res))) return;
+    const ok = await supabasePayrollTax.verifyProfile(req.auth.tid, parseInt(req.params.id), req.auth.uid);
+    if(!ok) return res.status(404).json({ success:false, error:'Tax profile not found' });
+    await supabasePayrollTax.writeAuditLog(req.auth.tid, req.auth.uid, 'VerifyTaxProfile', `profile ${req.params.id}`);
+    res.json({ success:true });
+  }catch(e){ res.status(500).json({ success:false, error:e.message }); }
+});
+
+app.delete('/api/hr/tax-profiles/:id', requireAuth, async (req, res)=>{
+  try{
+    if(!(await requireHrManage(req, res))) return;
+    const ok = await supabasePayrollTax.deleteProfile(req.auth.tid, parseInt(req.params.id));
+    if(!ok) return res.status(404).json({ success:false, error:'Tax profile not found' });
+    res.json({ success:true });
+  }catch(e){ res.status(500).json({ success:false, error:e.message }); }
+});
+
+// Try a profile against a sample monthly gross without saving anything
+app.post('/api/hr/tax-profiles/calculate', requireAuth, async (req, res)=>{
+  try{
+    const b = req.body||{};
+    const rules = (b.rules||[]).map(r=>({ ...r, base_cap:r.baseCap, amount_cap:r.amountCap, fixed_amount:r.fixedAmount }));
+    res.json({ success:true, data: supabasePayrollTax.computeEmployeeTaxes({ rules }, Number(b.monthlyGross)||0) });
+  }catch(e){ res.status(500).json({ success:false, error:e.message }); }
+});
 
 app.get('/api/hr/payroll/preview', requireAuth, async (req, res)=>{
   try{
@@ -4010,7 +4103,9 @@ app.get('/api/hr/payroll/preview', requireAuth, async (req, res)=>{
     if(!period) return res.status(400).json({ success:false, error:'period required' });
     if (ENABLE_SUPABASE_HR) {
       const baseRows = await supabaseHr.getPayrollBaseRows(req.auth.tid);
-      return res.json({ success:true, data: computePayrollRows(baseRows, period) });
+      const ctx = await loadPayrollTaxContext(req.auth.tid, period);
+      return res.json({ success:true, data: computePayrollRows(baseRows, period, ctx.profile, ctx.flags),
+        taxStatus: { profileId: ctx.profile?.id || null, ...ctx.status } });
     }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request().input('tid', req.auth.tid||0);
@@ -4050,7 +4145,7 @@ app.get('/api/hr/payroll/preview', requireAuth, async (req, res)=>{
         tax = Number(row.FederalWithholding||0) + Number(row.StateWithholding||0);
       }
       
-      const fica = Number(row.MTD_Fica||0) || (basic * 0.0765); // 7.65% FICA if not set
+      const fica = Number(row.MTD_Fica||0); // no assumed rate: set up taxes in HR > Taxes
       const other = Number(row.MTD_Other||0) || Number(row.Deductions||0);
       const absentDays = 0;
       const absentDed = 0;
@@ -4081,8 +4176,14 @@ app.post('/api/hr/payroll/generate', requireAuth, async (req, res)=>{
     const period = (body.period||'').toString();
     if(!period) return res.status(400).json({ success:false, error:'period required' });
     if (ENABLE_SUPABASE_HR) {
+      // Payroll must not run on unverified or missing tax setup, and HR must
+      // explicitly confirm the taxes for this period (recorded for audit).
+      const ctx = await loadPayrollTaxContext(req.auth.tid, period);
+      if (!ctx.status.ready) return res.status(400).json({ success:false, error: ctx.status.message, code:'TAX_SETUP_REQUIRED' });
+      if (body.confirmTaxes !== true) return res.status(400).json({ success:false, error:'Confirm that the tax setup is correct for this period before generating payroll.', code:'TAX_CONFIRMATION_REQUIRED' });
+      await supabasePayrollTax.recordConfirmation(req.auth.tid, period, ctx.profile.id, req.auth.uid);
       const baseRows = await supabaseHr.getPayrollBaseRows(req.auth.tid);
-      const rows = computePayrollRows(baseRows, period);
+      const rows = computePayrollRows(baseRows, period, ctx.profile, ctx.flags);
       let dueDate = null;
       try{
         const parts = period.split('-');
@@ -4134,7 +4235,7 @@ app.post('/api/hr/payroll/generate', requireAuth, async (req, res)=>{
         tax = Number(row.FederalWithholding||0) + Number(row.StateWithholding||0);
       }
       
-      const fica = Number(row.MTD_Fica||0) || (basic * 0.0765);
+      const fica = Number(row.MTD_Fica||0); // no assumed rate: set up taxes in HR > Taxes
       const other = Number(row.MTD_Other||0) || Number(row.Deductions||0);
       const absentDays = 0;
       const absentDed = 0;
@@ -5908,6 +6009,13 @@ app.listen(PORT, () => {
   console.log('  - DELETE /api/contacts/:id (Delete contact)');
   console.log('  - DELETE /api/contacts (Delete all contacts)');
   console.log('');
+});
+
+// Safety routes don't require login, but some (e.g. corrective-action status)
+// check the caller's role, so attach req.auth whenever a valid cookie is present.
+app.use('/api/safety', (req, _res, next) => {
+  try { if (!req.auth && req.cookies?.auth) req.auth = verifyToken(req.cookies.auth); } catch (e) { /* invalid/expired token: treat as anonymous */ }
+  next();
 });
 
 // ── Postgres safety routes: no SQL Server dependency, register immediately ──

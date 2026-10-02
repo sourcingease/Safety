@@ -17,7 +17,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-const files = ['01_schema.sql', '02_functions.sql', '03_seed.sql', '04_safety_schema.sql', '05_safety_extra_schema.sql'];
+const files = ['01_schema.sql', '02_functions.sql', '03_seed.sql', '04_safety_schema.sql', '05_safety_extra_schema.sql', '06_payroll_tax_schema.sql'];
 
 (async () => {
   const client = await pool.connect();

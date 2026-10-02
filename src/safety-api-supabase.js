@@ -375,24 +375,55 @@ function setupSafetyRoutes(app) {
     } catch (err) { res.status(500).json({ success: false, error: err.message }); }
   });
 
+  // True when the audit has at least one issue item and every issue item's
+  // latest corrective action is marked Closed.
+  async function allIssuesClosed(auditId) {
+    const r = await p.query(
+      `select (select c.status from safety_audit_corrective_action c
+                where c.audit_item_id = i.id order by c.created_date desc, c.id desc limit 1) as status
+         from safety_audit_item i
+        where i.audit_id = $1 and (i.no_issue = false or coalesce(trim(i.issue_details), '') <> '')`,
+      [auditId]
+    );
+    return r.rows.length > 0 && r.rows.every(x => x.status === 'Closed');
+  }
+
   app.post('/api/safety/audits/:id/items', async (req, res) => {
     try {
       const id = parseInt(req.params.id);
       const items = Array.isArray(req.body.items) ? req.body.items : [];
       if (items.length === 0) return res.status(400).json({ success: false, error: 'No items provided' });
-      await p.query('delete from safety_audit_item where audit_id = $1', [id]);
+      // Update rows in place (keeping their ids) so corrective actions, which
+      // reference safety_audit_item.id, stay attached across saves. Rows sent
+      // without a known Id are inserted; rows no longer sent are removed.
+      const existing = await p.query('select id from safety_audit_item where audit_id = $1', [id]);
+      const existingIds = new Set(existing.rows.map(r => r.id));
+      const keptIds = new Set();
       for (const it of items) {
         const hasNoIssueFlag = (typeof it.NoIssue === 'boolean');
         const noIssue = hasNoIssueFlag ? (it.NoIssue === false ? false : true) : true;
-        await p.query(
-          `insert into safety_audit_item(audit_id, head, value, no_issue, issue_details, attachments, suggested_action, informed_to)
-           values ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [id, it.Head || '', it.Value || null, noIssue, it.IssueDetails || null, it.Attachments || null, it.SuggestedAction || null, it.InformedTo || null]
-        );
+        const vals = [it.Head || '', it.Value || null, noIssue, it.IssueDetails || null, it.Attachments || null, it.SuggestedAction || null, it.InformedTo || null];
+        const itemId = parseInt(it.Id);
+        if (existingIds.has(itemId) && !keptIds.has(itemId)) {
+          await p.query(
+            `update safety_audit_item set head=$2, value=$3, no_issue=$4, issue_details=$5, attachments=$6,
+               suggested_action=$7, informed_to=$8, updated_date=now() where id=$1`,
+            [itemId, ...vals]
+          );
+          keptIds.add(itemId);
+        } else {
+          await p.query(
+            `insert into safety_audit_item(audit_id, head, value, no_issue, issue_details, attachments, suggested_action, informed_to)
+             values ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [id, ...vals]
+          );
+        }
       }
+      const removeIds = [...existingIds].filter(x => !keptIds.has(x));
+      if (removeIds.length) await p.query('delete from safety_audit_item where id = any($1::int[])', [removeIds]);
       const anyAnswered = items.some(i => typeof i.NoIssue === 'boolean' || (i.IssueDetails && i.IssueDetails.trim() !== ''));
       const anyIssues = items.some(i => i.NoIssue === false || (i.IssueDetails && i.IssueDetails.trim() !== ''));
-      const newStatus = !anyAnswered ? 'Planned' : (anyIssues ? 'OpenIssues' : 'Closed');
+      const newStatus = !anyAnswered ? 'Planned' : (anyIssues ? ((await allIssuesClosed(id)) ? 'Closed' : 'OpenIssues') : 'Closed');
       await p.query('update safety_audit_plan set status = $2, updated_date = now() where id = $1', [id, newStatus]);
       res.json({ success: true, message: 'Audit items saved', status: newStatus });
     } catch (err) { res.status(500).json({ success: false, error: err.message }); }
@@ -427,8 +458,10 @@ function setupSafetyRoutes(app) {
         [parseInt(itemId), correctiveActionTaken || null, attachments || null, correctiveActionBy || null,
           correctiveActionOn || null, resolutionMode || null, amountVal, statusToSave]
       );
-      await p.query(`update safety_audit_plan set status = 'CorrectiveSubmitted', updated_date = now() where id = $1`, [parseInt(auditId)]);
-      res.json({ success: true, id: r.rows[0].id, message: 'Corrective action saved' });
+      // Closing the last open issue closes the whole audit
+      const planStatus = (await allIssuesClosed(parseInt(auditId))) ? 'Closed' : 'CorrectiveSubmitted';
+      await p.query(`update safety_audit_plan set status = $2, updated_date = now() where id = $1`, [parseInt(auditId), planStatus]);
+      res.json({ success: true, id: r.rows[0].id, message: 'Corrective action saved', statusSaved: statusToSave, auditStatus: planStatus });
     } catch (err) { res.status(500).json({ success: false, error: err.message }); }
   });
 
