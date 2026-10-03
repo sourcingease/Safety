@@ -554,6 +554,17 @@ app.post('/api/test-connection', async (req, res) => {
 });
 
 // Registration (Owner signup creates tenant)
+// The registration form sends lower-case keys (e.g. "vendor", "safetyAuditor");
+// business_types.code uses PascalCase codes, and the lookup is exact.
+const BUSINESS_TYPE_ALIASES = {
+  buyer: 'Buyer', designer: 'Designer', manufacturer: 'Manufacturer', vendor: 'Supplier', supplier: 'Supplier',
+  inspection: 'Inspection', buyingagent: 'BuyingAgent', safetyauditor: 'SafetyAuditor', safetyoffice: 'SafetyOffice',
+};
+function normalizeBusinessType(value) {
+  const key = String(value || '').replace(/[\s_-]/g, '').toLowerCase();
+  return BUSINESS_TYPE_ALIASES[key] || value;
+}
+
 app.post('/api/auth/register', async (req, res) => {
   const { 
     email, password, fullName, businessType, tenantName, termsAccepted, captchaToken,
@@ -564,8 +575,8 @@ app.post('/api/auth/register', async (req, res) => {
   const finalEmail = email || req.body.companyEmail;
   const finalFullName = fullName || (firstName && lastName ? `${firstName} ${lastName}` : '');
   const finalTenantName = tenantName || companyName;
-  const finalBusinessType = businessType || registerAs;
-  
+  const finalBusinessType = normalizeBusinessType(businessType || registerAs);
+
   if (!finalEmail || !password || !finalFullName || !finalBusinessType || !finalTenantName) {
     return res.status(400).json({ success: false, error: 'Missing required fields' });
   }
@@ -743,8 +754,20 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ success: true });
 });
 
+// Admin-only helpers below: signed-in users with USER_MANAGE (Owner, HR Manager).
+// Without this anyone could relay mail through our SMTP account or mark any
+// account as email-verified.
+function requireUserAdmin(req, res, next) {
+  requireAuth(req, res, async () => {
+    try {
+      if (await supabaseAuth.hasPermission(req.auth.tid, req.auth.uid, 'USER_MANAGE')) return next();
+      return res.status(403).json({ success: false, error: 'Administrator permission required' });
+    } catch (e) { return res.status(500).json({ success: false, error: e.message }); }
+  });
+}
+
 // Test SMTP configuration
-app.post('/api/auth/test-smtp', async (req, res) => {
+app.post('/api/auth/test-smtp', requireUserAdmin, async (req, res) => {
   if (!transporter) {
     return res.json({ success: false, error: 'SMTP not configured. Please set SMTP_HOST, SMTP_USER, SMTP_PASS in .env file' });
   }
@@ -766,13 +789,18 @@ app.post('/api/auth/test-smtp', async (req, res) => {
 });
 
 // Manual email verification (for development/testing)
-app.post('/api/auth/manual-verify', async (req, res) => {
+app.post('/api/auth/manual-verify', requireUserAdmin, async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ success: false, error: 'Email required' });
-  
+
   try {
     let updated = 0;
     if (ENABLE_SUPABASE_AUTH) {
+      // Only accounts that belong to the admin's own company
+      const member = await supabaseCore.tenantEmployees(req.auth.tid);
+      if (!(member || []).some(m => String(m.Email || m.email || '').toLowerCase() === String(email).toLowerCase())) {
+        return res.status(404).json({ success: false, error: 'No user with that email in your company' });
+      }
       updated = await supabaseAuth.manualVerifyEmailByEmail(email);
     } else {
       const connector = new AzureSQLConnector();
