@@ -242,6 +242,7 @@
           </thead>
           <tbody id="payRows"><tr><td colspan="11">Select a payroll month and click Preview Payroll.</td></tr></tbody>
         </table>
+        <div id="payRunNote" class="tax-banner warning" style="display:none;margin-top:8px"></div>
         <div style="display:flex;gap:12px;justify-content:flex-end;align-items:center;flex-wrap:wrap;margin-top:8px">
           <label style="display:flex;gap:6px;align-items:flex-start;font-size:13px;max-width:560px">
             <input type="checkbox" id="confirmTaxes" onchange="updateGenerateEnabled()" style="margin-top:3px" />
@@ -295,8 +296,35 @@
         </div>
       </div>
       <div class="tab-panel" id="panel-advance" style="display:none">
-        <div style="font-weight:700;margin-bottom:6px">Advance Salary</div>
-        <p class="muted">This tab is reserved for managing employee advance salary requests and repayments.</p>
+        <div style="font-weight:700;margin-bottom:2px">Advance Salary</div>
+        <div class="muted" style="margin-bottom:10px">Request an advance, HR approves it (a payable is created so Accounts pays it out), then it is recovered from payroll in monthly installments.</div>
+
+        <div class="card" style="background:#f8fafc">
+          <div style="font-weight:700;margin-bottom:8px">New request</div>
+          <div class="grid">
+            <div class="form-group" id="AdvEmpWrap"><label class="form-label">Employee</label><select id="AdvEmp" class="form-select"></select></div>
+            <div class="form-group"><label class="form-label">Amount *</label><input id="AdvAmount" type="number" step="0.01" min="0" class="form-input" oninput="advPreview()"/></div>
+            <div class="form-group"><label class="form-label">Installments (1–24) *</label><input id="AdvInst" type="number" min="1" max="24" value="1" class="form-input" oninput="advPreview()"/></div>
+            <div class="form-group"><label class="form-label">First deduction month *</label><input id="AdvStart" type="month" class="form-input"/></div>
+            <div class="form-group" style="grid-column:span 2"><label class="form-label">Reason</label><input id="AdvReason" class="form-input" placeholder="e.g. medical expense"/></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px">
+            <div class="muted" id="AdvCalc"></div>
+            <button class="ct primary" type="button" onclick="submitAdvance()">Submit request</button>
+          </div>
+        </div>
+
+        <div style="display:flex;justify-content:space-between;align-items:end;gap:8px;flex-wrap:wrap;margin:8px 0">
+          <div style="font-weight:700">Requests</div>
+          <div class="form-group"><label class="form-label">Status</label>
+            <select id="AdvFilter" class="form-select" onchange="loadAdvances()">
+              <option value="">All</option><option>Pending</option><option>Approved</option><option>Repaid</option><option>Rejected</option><option>Cancelled</option>
+            </select></div>
+        </div>
+        <div style="overflow-x:auto"><table>
+          <thead><tr><th>Employee</th><th>Amount</th><th>Installments</th><th>Monthly</th><th>From</th><th>Recovered</th><th>Outstanding</th><th>Status</th><th>Requested</th><th>Decision</th><th></th></tr></thead>
+          <tbody id="AdvRows"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
+        </table></div>
       </div>
     </div>
 
@@ -454,7 +482,7 @@
         if (email && window.EmpEmail) EmpEmail.value = email;
       }catch(e){}
     })();
-    function showTab(id){ if(id==='taxes' && typeof loadTaxProfiles==='function') loadTaxProfiles(); ['main','totals','paydetails','payroll','attendance','advance','taxes'].forEach(t=>{ var panel=document.getElementById('panel-'+t); var tab=document.getElementById('tab-'+t); if(panel) panel.style.display = (t===id)?'block':'none'; if(tab) tab.classList.toggle('active', t===id); }); }
+    function showTab(id){ if(id==='taxes' && typeof loadTaxProfiles==='function') loadTaxProfiles(); if(id==='advance' && typeof loadAdvances==='function') loadAdvances(); ['main','totals','paydetails','payroll','attendance','advance','taxes'].forEach(t=>{ var panel=document.getElementById('panel-'+t); var tab=document.getElementById('tab-'+t); if(panel) panel.style.display = (t===id)?'block':'none'; if(tab) tab.classList.toggle('active', t===id); }); }
 
     // Allow deep linking to specific HR tabs, e.g. ?tab=payroll or ?tab=salary
     (function(){
@@ -788,7 +816,13 @@
         payrollPreview=(r.data||[]);
         renderPayrollPreview();
         showTaxBanner(r.taxStatus);
-        payrollTaxReady = !!(r.taxStatus && r.taxStatus.ready);
+        payrollTaxReady = !!(r.taxStatus && r.taxStatus.ready) && !r.alreadyGenerated;
+        const gen = r.alreadyGenerated;
+        const note = document.getElementById('payRunNote');
+        if(note){
+          note.style.display = gen ? '' : 'none';
+          if(gen) note.textContent = `Payroll for ${period} was already generated on ${new Date(gen.generated_at).toLocaleString()}${gen.generated_by_name ? ' by ' + gen.generated_by_name : ''} (${gen.employee_count} employee(s)). It cannot be generated again; this preview is for reference only.`;
+        }
         updateGenerateEnabled();
       }catch(e){
         console.error(e);
@@ -965,6 +999,75 @@
         out.innerHTML=(d.lines||[]).map(l=>`${escHtml(l.name)} (${escHtml(l.payer)}): <b>${l.amount}</b>`).join(' · ') +
           `<br/>Employee deductions: <b>${(d.incomeTax+d.socialSecurity+d.otherEmployee).toFixed(2)}</b> · Net: <b>${(gross-d.incomeTax-d.socialSecurity-d.otherEmployee).toFixed(2)}</b> · Employer cost: <b>${d.employerCost}</b>`;
       }catch(e){ out.textContent='Calculation failed'; }
+    }
+
+    // --- Advance salary ---
+    var advMe = null;
+    function advPreview(){
+      const amt=Number(document.getElementById('AdvAmount').value||0), inst=Math.max(1,parseInt(document.getElementById('AdvInst').value||1));
+      document.getElementById('AdvCalc').textContent = amt>0 ? `Monthly deduction: ${(amt/inst).toFixed(2)} for ${inst} month(s)` : '';
+    }
+    async function loadAdvances(){
+      const body=document.getElementById('AdvRows');
+      try{
+        const st=document.getElementById('AdvFilter').value;
+        const r=await j('/api/hr/advances'+(st?('?status='+encodeURIComponent(st)):''));
+        advMe=r.me||{};
+        // Employee picker: HR can request for anyone; others only for themselves
+        const sel=document.getElementById('AdvEmp');
+        if(advMe.isHr){
+          document.getElementById('AdvEmpWrap').style.display='';
+          if(!sel.options.length){
+            if(!employees.length){ try{ employees=(await j('/api/hr/employees')).data||[]; }catch(e){} }
+            sel.innerHTML=employees.map(e=>`<option value="${e.CompanyUserId}">${escHtml(e.FullName||e.Email||('#'+e.CompanyUserId))}</option>`).join('');
+          }
+        } else { document.getElementById('AdvEmpWrap').style.display='none'; }
+        const startEl=document.getElementById('AdvStart');
+        if(!startEl.value){ const d=new Date(); d.setMonth(d.getMonth()+1); startEl.value=d.toISOString().slice(0,7); }
+        const pill=s=>`<span class="tax-pill ${s==='Approved'||s==='Repaid'?'ok':(s==='Pending'?'off':'bad')}">${escHtml(s)}</span>`;
+        const n=v=>Number(v||0).toFixed(2);
+        body.innerHTML = (r.data||[]).length ? r.data.map(a=>{
+          const mine = a.RequestedById===advMe.userId || a.EmployeeId===advMe.employeeId;
+          let actions='';
+          if(a.Status==='Pending' && advMe.isHr && !mine){
+            actions=`<input id="advNote_${a.Id}" class="form-input" style="min-width:140px" placeholder="Note (required to reject)"/>
+              <button class="ct primary" type="button" onclick="decideAdvance(${a.Id},'Approved')">Approve</button>
+              <button class="ct" type="button" onclick="decideAdvance(${a.Id},'Rejected')">Reject</button>`;
+          } else if(a.Status==='Pending' && a.RequestedById===advMe.userId){
+            actions=`<button class="ct" type="button" onclick="cancelAdvance(${a.Id})">Cancel</button>`;
+          } else if(a.Status==='Pending' && mine){ actions='<span class="muted">Waiting for another HR manager</span>'; }
+          return `<tr><td>${escHtml(a.EmployeeName)}</td><td>${n(a.Amount)}</td><td>${a.Installments}</td><td>${n(a.MonthlyDeduction)}</td><td>${escHtml(a.StartPeriod)}</td>
+            <td>${n(a.RepaidAmount)}</td><td>${n(a.Outstanding)}</td><td>${pill(a.Status)}</td>
+            <td class="muted">${escHtml(a.RequestedBy||'')}<br/>${new Date(a.RequestedAt).toLocaleDateString()}${a.Reason?'<br/>'+escHtml(a.Reason):''}</td>
+            <td class="muted">${a.DecidedBy?escHtml(a.DecidedBy)+'<br/>'+new Date(a.DecidedAt).toLocaleDateString():''}${a.DecisionNote?'<br/>'+escHtml(a.DecisionNote):''}</td>
+            <td style="white-space:nowrap">${actions}</td></tr>`;
+        }).join('') : '<tr><td colspan="11" class="muted">No advance requests.</td></tr>';
+      }catch(e){ body.innerHTML=`<tr><td colspan="11" class="muted">${escHtml(e.message)}</td></tr>`; }
+    }
+    async function submitAdvance(){
+      const v=id=>document.getElementById(id).value;
+      const payload={ amount:Number(v('AdvAmount')), installments:parseInt(v('AdvInst')||1), startPeriod:v('AdvStart'), reason:v('AdvReason') };
+      if(advMe && advMe.isHr && v('AdvEmp')) payload.employeeId=parseInt(v('AdvEmp'));
+      const r=await fetch('/api/hr/advances',{ method:'POST', credentials:'include', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+      const d=await r.json().catch(()=>({}));
+      if(!r.ok||d.success===false){ alert((d.errors||[d.error||'Failed to submit']).join('\n')); return; }
+      ['AdvAmount','AdvReason'].forEach(id=>document.getElementById(id).value=''); document.getElementById('AdvInst').value='1'; advPreview();
+      loadAdvances();
+    }
+    async function decideAdvance(id, decision){
+      const note=(document.getElementById('advNote_'+id)||{}).value||'';
+      if(decision==='Approved' && !confirm('Approve this advance? A payable will be created so Accounts can pay it out.')) return;
+      const r=await fetch('/api/hr/advances/'+id+'/decision',{ method:'POST', credentials:'include', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ decision, note }) });
+      const d=await r.json().catch(()=>({}));
+      if(!r.ok||d.success===false){ alert(d.error||'Failed'); return; }
+      loadAdvances();
+    }
+    async function cancelAdvance(id){
+      if(!confirm('Cancel this request?')) return;
+      const r=await fetch('/api/hr/advances/'+id+'/cancel',{ method:'POST', credentials:'include' });
+      const d=await r.json().catch(()=>({}));
+      if(!r.ok||d.success===false){ alert(d.error||'Failed'); return; }
+      loadAdvances();
     }
 
     document.getElementById('PayMonth')?.addEventListener('change', loadTaxStatus);

@@ -29,6 +29,7 @@ const supabaseHr = require('./db/supabase-hr');
 const supabaseAccounting = require('./db/supabase-accounting');
 const supabaseCore = require('./db/supabase-core');
 const supabasePayrollTax = require('./db/supabase-payroll-tax');
+const supabaseAdvances = require('./db/supabase-advances');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -389,39 +390,54 @@ app.use('/api', (req, _res, next) => {
 
 // API Routes
 
-// Lightweight tasks API for planner (file-backed JSON store)
-const fsPromises = require('fs').promises;
-const TASKS_FILE = path.join(__dirname, '../database/tasks.json');
-async function loadTasks(){ try{ const s = await fsPromises.readFile(TASKS_FILE, 'utf8'); return JSON.parse(s); }catch{ return []; } }
-async function saveTasks(list){ try{ await fsPromises.mkdir(path.dirname(TASKS_FILE), { recursive:true }); await fsPromises.writeFile(TASKS_FILE, JSON.stringify(list, null, 2), 'utf8'); }catch{} }
-app.get('/api/tasks', async (req, res)=>{
+// Task planner API: per-company rows in planner_task (signed-in users only).
+// Response shape matches the planner pages ({id,title,date,assigneeId,startHour,endHour,priority,note}).
+let tasksPgPool = null;
+const tasksDb = () => (tasksPgPool = tasksPgPool || require('./db/supabase').createSupabasePgPool());
+const TASK_COLS = `id, title, to_char(task_date,'YYYY-MM-DD') as "date", assignee_id as "assigneeId",
+  start_hour as "startHour", end_hour as "endHour", priority, note`;
+const validTaskDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
+app.get('/api/tasks', requireAuth, async (req, res)=>{
   try{
     const date = (req.query.date||'').toString();
-    const all = await loadTasks();
-    const rows = date ? all.filter(t=>t.date===date) : all;
-    return res.json({ success:true, data: rows });
+    const r = date && validTaskDate(date)
+      ? await tasksDb().query(`select ${TASK_COLS} from planner_task where tenant_id=$1 and task_date=$2 order by start_hour, created_at`, [req.auth.tid, date])
+      : await tasksDb().query(`select ${TASK_COLS} from planner_task where tenant_id=$1 order by task_date, start_hour, created_at`, [req.auth.tid]);
+    return res.json({ success:true, data: r.rows });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
-app.post('/api/tasks', async (req, res)=>{
+app.post('/api/tasks', requireAuth, async (req, res)=>{
   try{
-    const p = req.body||{}; if(!p.date) return res.status(400).json({ success:false, error:'date required' });
-    const all = await loadTasks();
-    const id = 't_'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
-    const row = { id, title:p.title||'Task', date:p.date, assigneeId:parseInt(p.assigneeId)||1, startHour:parseInt(p.startHour)||0, endHour:parseInt(p.endHour)||1, priority:p.priority||'High', note:p.note||null };
-    all.push(row); await saveTasks(all);
+    const p = req.body||{}; if(!validTaskDate(p.date)) return res.status(400).json({ success:false, error:'date required (YYYY-MM-DD)' });
+    const id = 't_'+Date.now().toString(36)+crypto.randomBytes(3).toString('hex');
+    await tasksDb().query(
+      `insert into planner_task(id, tenant_id, title, task_date, assignee_id, start_hour, end_hour, priority, note, created_by)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [id, req.auth.tid, (p.title||'Task').toString().slice(0,300), p.date, parseInt(p.assigneeId)||null,
+        parseInt(p.startHour)||0, parseInt(p.endHour)||1, p.priority||'High', p.note||null, req.auth.uid]);
     return res.json({ success:true, id });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
-app.put('/api/tasks/:id', async (req, res)=>{
+app.put('/api/tasks/:id', requireAuth, async (req, res)=>{
   try{
-    const id = (req.params.id||'').toString(); const p=req.body||{};
-    const all = await loadTasks(); const idx = all.findIndex(x=>x.id===id); if(idx<0) return res.status(404).json({ success:false, error:'not found' });
-    const t = all[idx]; Object.assign(t, { title: p.title??t.title, date: p.date??t.date, assigneeId: p.assigneeId!=null?parseInt(p.assigneeId):t.assigneeId, startHour: p.startHour!=null?parseInt(p.startHour):t.startHour, endHour: p.endHour!=null?parseInt(p.endHour):t.endHour, priority: p.priority??t.priority, note: p.note??t.note });
-    await saveTasks(all); return res.json({ success:true });
+    const p=req.body||{};
+    if(p.date!=null && !validTaskDate(p.date)) return res.status(400).json({ success:false, error:'date must be YYYY-MM-DD' });
+    const r = await tasksDb().query(
+      `update planner_task set title=coalesce($3,title), task_date=coalesce($4::date,task_date), assignee_id=coalesce($5,assignee_id),
+         start_hour=coalesce($6,start_hour), end_hour=coalesce($7,end_hour), priority=coalesce($8,priority), note=coalesce($9,note), updated_at=now()
+       where id=$1 and tenant_id=$2`,
+      [String(req.params.id), req.auth.tid, p.title??null, p.date??null, p.assigneeId!=null?parseInt(p.assigneeId):null,
+        p.startHour!=null?parseInt(p.startHour):null, p.endHour!=null?parseInt(p.endHour):null, p.priority??null, p.note??null]);
+    if(!r.rowCount) return res.status(404).json({ success:false, error:'not found' });
+    return res.json({ success:true });
   }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
-app.delete('/api/tasks/:id', async (req, res)=>{
-  try{ const id=(req.params.id||'').toString(); const all=await loadTasks(); const next=all.filter(x=>x.id!==id); if(next.length===all.length) return res.status(404).json({ success:false, error:'not found' }); await saveTasks(next); return res.json({ success:true }); }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+app.delete('/api/tasks/:id', requireAuth, async (req, res)=>{
+  try{
+    const r = await tasksDb().query('delete from planner_task where id=$1 and tenant_id=$2', [String(req.params.id), req.auth.tid]);
+    if(!r.rowCount) return res.status(404).json({ success:false, error:'not found' });
+    return res.json({ success:true });
+  }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 });
 
 // ==================== MULTI-AGENT API ====================
@@ -1160,7 +1176,7 @@ async function ensureDemoUser(email){
 }
 
 // Dev helper: seed standard demo employees and return list
-app.post('/api/demo/seed-employees', async (_req, res) => {
+app.post('/api/demo/seed-employees', requireUserAdmin, async (_req, res) => {
   try{
     const emails = ['hr@demo.example','sales@demo.example','buyer@demo.example','supplier@demo.example','designer@demo.example','auditor@demo.example','safety@demo.example','inspection@demo.example'];
     const out = [];
@@ -1170,10 +1186,23 @@ app.post('/api/demo/seed-employees', async (_req, res) => {
 });
 
 // Login with mandatory TOTP 2FA (Google Authenticator) for all users
+// Demo accounts (…@demo.example, public passwords) only work while
+// AUTO_SEED_DEMO is not "0". Turning it off disables them without deleting data.
+const demoAccountsEnabled = () => process.env.AUTO_SEED_DEMO !== '0';
+const isDemoEmail = (email) => /@demo\.example$/i.test(String(email || '').trim());
+
+// Settings the login page needs before anyone signs in
+app.get('/api/public-config', (req, res) => {
+  res.json({ success: true, data: { demoAccounts: demoAccountsEnabled() } });
+});
+
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
     return res.status(400).json({ success: false, error: 'Email and password are required' });
+  }
+  if (!demoAccountsEnabled() && isDemoEmail(email)) {
+    return res.status(403).json({ success: false, error: 'Demo accounts are disabled on this site' });
   }
 
   try {
@@ -1809,31 +1838,29 @@ app.delete('/api/contacts', requireAuth, async (req, res) => {
   }
 });
 
+// Public (landing page): status only, never infrastructure names
 app.get('/api/agent/status', (req, res) => {
   res.json({
     success: true,
-    data: ENABLE_SUPABASE_AUTH ? {
+    data: {
       status: 'running',
-      database: 'Supabase Postgres',
-      server: (process.env.SUPABASE_URL || '').replace(/^https?:\/\//, ''),
-      uptime: process.uptime(),
-      version: '1.0.0'
-    } : {
-      status: 'running',
-      database: process.env.AZURE_SQL_DATABASE || 'SeApp2',
-      server: process.env.AZURE_SQL_SERVER || 'zlnsw9feuf.database.windows.net',
       uptime: process.uptime(),
       version: '1.0.0'
     }
   });
 });
 
-// Tenant summary for dashboard
-app.get('/api/tenants/by-email', async (req, res) => {
+// Companies of an email: signed-in users may only look up their own email
+// (otherwise anyone could discover which companies an address belongs to).
+app.get('/api/tenants/by-email', requireAuth, async (req, res) => {
   const email = (req.query.email || '').toString();
   if (!email) return res.status(400).json({ success: false, error: 'email required' });
   try {
-    if (ENABLE_SUPABASE_AUTH) { const data = await supabaseCore.tenantsByEmail(email); return res.json({ success: true, data }); }
+    if (ENABLE_SUPABASE_AUTH) {
+      const me = await supabaseAuth.getUserById(req.auth.uid);
+      if (!me || String(me.Email || '').toLowerCase() !== email.toLowerCase()) return res.status(403).json({ success: false, error: 'You can only look up your own email' });
+      const data = await supabaseCore.tenantsByEmail(email); return res.json({ success: true, data });
+    }
     const connector = new AzureSQLConnector();
     await connector.connect();
     const request = connector.pool.request();
@@ -4015,7 +4042,8 @@ app.put('/api/hr/employees/:id/pay-details', requireAuth, async (req, res)=>{
 // employee's Totals/Pay Details override the profile for that employee
 // (TaxSource 'manual'). There is no built-in default rate: without a profile
 // nothing is withheld and payroll generation is blocked.
-function computePayrollRows(baseRows, period, taxProfile, taxFlags) {
+// advanceMap: { employeeId: { amount } } salary-advance installments due this period
+function computePayrollRows(baseRows, period, taxProfile, taxFlags, advanceMap) {
   const r2 = n => Math.round((Number(n)||0) * 100) / 100;
   return (baseRows||[]).map(row=>{
     let basic = Number(row.MTD_Gross||0);
@@ -4033,12 +4061,16 @@ function computePayrollRows(baseRows, period, taxProfile, taxFlags) {
     const tax = manualTax || calc.incomeTax;
     const fica = manualSocial || calc.socialSecurity;
     const other = (Number(row.MTD_Other||0) || Number(row.Deductions||0)) + calc.otherEmployee;
-    const absentDays = 0, absentDed = 0, advDed = 0;
+    const absentDays = 0, absentDed = 0;
+    // Advance installment, never more than the pay left after tax and deductions
+    const payable = Math.max(0, basic - tax - fica - other - absentDed);
+    const advDue = Number(((advanceMap||{})[row.EmployeeId]||{}).amount||0);
+    const advDed = Math.min(advDue, payable);
     const net = basic - tax - fica - other - absentDed - advDed;
     return {
       EmployeeId: row.EmployeeId, EmployeeName: row.EmployeeName, Period: period,
       BasicSalary: r2(basic), Tax: r2(tax), Fica: r2(fica), AbsentDays: absentDays,
-      AbsentDeduction: absentDed, AdvanceDeduction: advDed, OtherDeduction: r2(other),
+      AbsentDeduction: absentDed, AdvanceDeduction: r2(advDed), AdvanceDue: r2(advDue), OtherDeduction: r2(other),
       NetPay: net > 0 ? r2(net) : 0,
       EmployerTaxCost: calc.employerCost,
       TaxSource: (manualTax || manualSocial) ? 'manual' : (taxProfile ? 'profile' : 'none'),
@@ -4119,6 +4151,60 @@ app.delete('/api/hr/tax-profiles/:id', requireAuth, async (req, res)=>{
   }catch(e){ res.status(500).json({ success:false, error:e.message }); }
 });
 
+// ---- Salary advances (HR > Advance Salary) ----
+// Employees request and see their own; HR (MODULE_MANAGE_HR) sees all,
+// requests for anyone, and approves/rejects (never their own request).
+async function isHrManager(req) { return supabaseAuth.hasPermission(req.auth.tid, req.auth.uid, 'MODULE_MANAGE_HR'); }
+
+app.get('/api/hr/advances', requireAuth, async (req, res)=>{
+  try{
+    const hr = await isHrManager(req);
+    const myEmployeeId = await supabaseAdvances.employeeIdForUser(req.auth.tid, req.auth.uid);
+    const status = ['Pending','Approved','Rejected','Repaid','Cancelled'].includes(req.query.status) ? req.query.status : null;
+    const data = await supabaseAdvances.listAdvances(req.auth.tid, { status, employeeId: hr ? (parseInt(req.query.employeeId)||null) : (myEmployeeId || -1) });
+    res.json({ success:true, data, me: { employeeId: myEmployeeId, userId: req.auth.uid, isHr: hr } });
+  }catch(e){ res.status(500).json({ success:false, error:e.message }); }
+});
+
+app.post('/api/hr/advances', requireAuth, async (req, res)=>{
+  try{
+    const b = req.body||{};
+    const myEmployeeId = await supabaseAdvances.employeeIdForUser(req.auth.tid, req.auth.uid);
+    const employeeId = parseInt(b.employeeId) || myEmployeeId;
+    if (!employeeId) return res.status(400).json({ success:false, error:'Employee is required' });
+    if (employeeId !== myEmployeeId && !(await isHrManager(req))) return res.status(403).json({ success:false, error:'Only HR can request an advance for another employee' });
+    if (!(await supabaseAdvances.employeeInTenant(req.auth.tid, employeeId))) return res.status(404).json({ success:false, error:'Employee not found in your company' });
+    const errors = supabaseAdvances.validateAdvance(b);
+    if (errors.length) return res.status(400).json({ success:false, error: errors.join('; '), errors });
+    const id = await supabaseAdvances.createAdvance(req.auth.tid, { ...b, employeeId }, req.auth.uid);
+    res.json({ success:true, id });
+  }catch(e){ res.status(500).json({ success:false, error:e.message }); }
+});
+
+app.post('/api/hr/advances/:id/decision', requireAuth, async (req, res)=>{
+  try{
+    if (!(await isHrManager(req))) return res.status(403).json({ success:false, error:'Only HR managers can approve or reject advances' });
+    const decision = (req.body||{}).decision;
+    if (!['Approved','Rejected'].includes(decision)) return res.status(400).json({ success:false, error:'decision must be Approved or Rejected' });
+    const note = (req.body||{}).note || '';
+    if (decision === 'Rejected' && !note.trim()) return res.status(400).json({ success:false, error:'Give a reason when rejecting' });
+    const adv = await supabaseAdvances.getAdvance(req.auth.tid, parseInt(req.params.id));
+    if (!adv) return res.status(404).json({ success:false, error:'Advance not found' });
+    const myEmployeeId = await supabaseAdvances.employeeIdForUser(req.auth.tid, req.auth.uid);
+    if (adv.RequestedById === req.auth.uid || adv.EmployeeId === myEmployeeId) return res.status(403).json({ success:false, error:'You cannot decide your own advance; another HR manager must' });
+    await supabaseAdvances.decideAdvance(req.auth.tid, adv.Id, decision, note, req.auth.uid);
+    res.json({ success:true });
+  }catch(e){ res.status(e.status||500).json({ success:false, error:e.message }); }
+});
+
+app.post('/api/hr/advances/:id/cancel', requireAuth, async (req, res)=>{
+  try{
+    const ok = await supabaseAdvances.cancelAdvance(req.auth.tid, parseInt(req.params.id), req.auth.uid);
+    if (!ok) return res.status(409).json({ success:false, error:'Only your own pending requests can be cancelled' });
+    res.json({ success:true });
+  }catch(e){ res.status(500).json({ success:false, error:e.message }); }
+});
+
 // Try a profile against a sample monthly gross without saving anything
 app.post('/api/hr/tax-profiles/calculate', requireAuth, async (req, res)=>{
   try{
@@ -4133,10 +4219,13 @@ app.get('/api/hr/payroll/preview', requireAuth, async (req, res)=>{
     const period = (req.query.period||'').toString();
     if(!period) return res.status(400).json({ success:false, error:'period required' });
     if (ENABLE_SUPABASE_HR) {
+      if (!supabaseAdvances.isPeriod(period)) return res.status(400).json({ success:false, error:'period must be YYYY-MM' });
       const baseRows = await supabaseHr.getPayrollBaseRows(req.auth.tid);
       const ctx = await loadPayrollTaxContext(req.auth.tid, period);
-      return res.json({ success:true, data: computePayrollRows(baseRows, period, ctx.profile, ctx.flags),
-        taxStatus: { profileId: ctx.profile?.id || null, ...ctx.status } });
+      const advances = await supabaseAdvances.deductionsForPeriod(req.auth.tid, period);
+      const run = await supabaseAdvances.getRun(req.auth.tid, period);
+      return res.json({ success:true, data: computePayrollRows(baseRows, period, ctx.profile, ctx.flags, advances),
+        taxStatus: { profileId: ctx.profile?.id || null, ...ctx.status }, alreadyGenerated: run });
     }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector);
     const rq=connector.pool.request().input('tid', req.auth.tid||0);
@@ -4212,24 +4301,46 @@ app.post('/api/hr/payroll/generate', requireAuth, async (req, res)=>{
       const ctx = await loadPayrollTaxContext(req.auth.tid, period);
       if (!ctx.status.ready) return res.status(400).json({ success:false, error: ctx.status.message, code:'TAX_SETUP_REQUIRED' });
       if (body.confirmTaxes !== true) return res.status(400).json({ success:false, error:'Confirm that the tax setup is correct for this period before generating payroll.', code:'TAX_CONFIRMATION_REQUIRED' });
-      await supabasePayrollTax.recordConfirmation(req.auth.tid, period, ctx.profile.id, req.auth.uid);
-      const baseRows = await supabaseHr.getPayrollBaseRows(req.auth.tid);
-      const rows = computePayrollRows(baseRows, period, ctx.profile, ctx.flags);
-      let dueDate = null;
-      try{
-        const parts = period.split('-');
-        const yy = parseInt(parts[0]||''); const mm = parseInt(parts[1]||'');
-        if(yy && mm) dueDate = new Date(yy, mm, 0);
-      }catch(e){}
-      let created = 0;
-      for(const row of rows){
-        const amt = Number(row.NetPay||0);
-        if(!amt) continue;
-        await supabaseHr.insertApInvoice({ tenantId: req.auth.tid, orderId: `PAY-${period}-${row.EmployeeId}`, productName: `Salary ${period}`,
-          dueDate, supplierName: row.EmployeeName || 'Employee', amount: amt, notes: 'Payroll generated from HR module', createdBy: req.auth.uid||null });
-        created++;
+      if (!supabaseAdvances.isPeriod(period)) return res.status(400).json({ success:false, error:'period must be YYYY-MM' });
+      // One run per month: a second run would duplicate payables and advance deductions
+      const existing = await supabaseAdvances.getRun(req.auth.tid, period);
+      const runId = existing ? null : await supabaseAdvances.claimRun(req.auth.tid, period, req.auth.uid);
+      if (!runId) {
+        const when = existing && existing.generated_at ? new Date(existing.generated_at).toLocaleString() : 'earlier';
+        return res.status(409).json({ success:false, code:'PAYROLL_ALREADY_GENERATED',
+          error:`Payroll for ${period} was already generated (${when}${existing && existing.generated_by_name ? ' by ' + existing.generated_by_name : ''}). It cannot be generated twice.` });
       }
-      return res.json({ success:true, count: created });
+      let created = 0, totalNet = 0;
+      try {
+        await supabasePayrollTax.recordConfirmation(req.auth.tid, period, ctx.profile.id, req.auth.uid);
+        const baseRows = await supabaseHr.getPayrollBaseRows(req.auth.tid);
+        const advances = await supabaseAdvances.deductionsForPeriod(req.auth.tid, period);
+        const rows = computePayrollRows(baseRows, period, ctx.profile, ctx.flags, advances);
+        let dueDate = null;
+        try{
+          const parts = period.split('-');
+          const yy = parseInt(parts[0]||''); const mm = parseInt(parts[1]||'');
+          if(yy && mm) dueDate = new Date(yy, mm, 0);
+        }catch(e){}
+        for(const row of rows){
+          const amt = Number(row.NetPay||0);
+          if(!amt) continue;
+          await supabaseHr.insertApInvoice({ tenantId: req.auth.tid, orderId: `PAY-${period}-${row.EmployeeId}`, productName: `Salary ${period}`,
+            dueDate, supplierName: row.EmployeeName || 'Employee', amount: amt,
+            notes: 'Payroll generated from HR module' + (row.AdvanceDeduction ? ` (advance recovered: ${row.AdvanceDeduction})` : ''), createdBy: req.auth.uid||null });
+          created++; totalNet += amt;
+        }
+        const applied = {};
+        for (const row of rows) applied[row.EmployeeId] = row.AdvanceDeduction || 0;
+        const totalAdvance = await supabaseAdvances.recordDeductions(req.auth.tid, period, advances, applied, runId);
+        await supabaseAdvances.finishRun(runId, created, totalNet, totalAdvance);
+        return res.json({ success:true, count: created, advanceRecovered: totalAdvance });
+      } catch (err) {
+        // Nothing posted yet: free the month so HR can retry. Otherwise keep the
+        // run so a retry can't post a second set of payables.
+        if (!created) await supabaseAdvances.releaseRun(runId).catch(()=>{});
+        throw err;
+      }
     }
     const connector=new AzureSQLConnector(); await connector.connect(); await ensureHrTables(connector); await ensureAccountingTables(connector); await ensureApArTables(connector);
     const rq=connector.pool.request().input('tid', req.auth.tid||0);

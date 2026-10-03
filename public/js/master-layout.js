@@ -1140,6 +1140,7 @@ window.renderMasterHeader = function(opts){
       const name = u.FullName || u.Email || '';
       const initials = name.split(/[\s@._-]+/).filter(Boolean).slice(0,2).map(function(w){ return w[0].toUpperCase(); }).join('') || '?';
       const roles = (j.data.roles || []).join(', ');
+      applyRoleIcons(hdr, j.data.roles || []);
       badge.textContent = initials; badge.title = name;
       menu.querySelector('.avatar').textContent = initials;
       menu.querySelector('.name').textContent = name;
@@ -1148,6 +1149,37 @@ window.renderMasterHeader = function(opts){
     }).catch(function(){});
   }
 };
+
+// Show only the module icons relevant to the user's roles (a convenience:
+// the server still enforces permissions). Owners/admins see everything; a
+// user whose roles aren't recognised also sees everything, so nobody is
+// locked out of a module by an unfamiliar role name.
+const ML_SHARED_ICONS = ['Tasks', 'Chat', 'Support', 'Check-in'];
+const ML_ICONS_BY_ROLE = [
+  [/owner|admin/i, null], // null = all icons
+  [/safety|auditor|inspect/i, ['Safety', 'Report', 'Tracking']],
+  [/\bhr\b|human resource|payroll/i, ['HR & Payroll', 'Email', 'Setup']],
+  [/account|finance/i, ['Accounting', 'Email']],
+  [/sales|buyer|supplier|vendor|designer|crm|marketing/i, ['CRM', 'Email']],
+];
+function applyRoleIcons(hdr, roleNames){
+  try{
+    let allowed = new Set(ML_SHARED_ICONS), matched = false;
+    for (const name of roleNames) {
+      for (const [re, icons] of ML_ICONS_BY_ROLE) {
+        if (!re.test(name)) continue;
+        matched = true;
+        if (icons === null) return; // full access
+        icons.forEach(i => allowed.add(i));
+      }
+    }
+    if (!matched) return;
+    hdr.querySelectorAll('.ml-icons .icon-item').forEach(function(it){
+      const label = (it.querySelector('.icon-label') || {}).textContent || '';
+      it.style.display = allowed.has(label.trim()) ? '' : 'none';
+    });
+  }catch(e){ /* never break the header */ }
+}
 
 // Auto-render if a dashboard header exists
 window.addEventListener('DOMContentLoaded', ()=>{ 

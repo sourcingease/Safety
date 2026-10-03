@@ -315,7 +315,7 @@
 
     <div id="status" class="status"></div>
 
-    <div class="demo-section">
+    <div class="demo-section" id="demoSection" style="display:none">
       <div class="demo-title">Demo Accounts</div>
       <div id="demoList" class="demo-list"></div>
     </div>
@@ -331,6 +331,10 @@
     ];
     const listEl = document.getElementById('demoList');
     listEl.innerHTML = DEMOS.map(d=>`<div class="demo-item"><button class="btn" onclick="quick('${d.email}','${d.password}')">Login as ${d.label}</button> <span class="muted">${d.email}</span></div>`).join('');
+    // Only show demo buttons when the server allows demo accounts
+    fetch('/api/public-config').then(r=>r.ok?r.json():null).then(j=>{
+      if(j && j.data && j.data.demoAccounts) document.getElementById('demoSection').style.display='';
+    }).catch(()=>{});
 
     function quick(email, password){
       document.getElementById('email').value = email;
