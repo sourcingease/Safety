@@ -6011,11 +6011,19 @@ app.listen(PORT, () => {
   console.log('');
 });
 
-// Safety routes don't require login, but some (e.g. corrective-action status)
-// check the caller's role, so attach req.auth whenever a valid cookie is present.
-app.use('/api/safety', (req, _res, next) => {
-  try { if (!req.auth && req.cookies?.auth) req.auth = verifyToken(req.cookies.auth); } catch (e) { /* invalid/expired token: treat as anonymous */ }
-  next();
+// Safety, water, waste, attendance and AI-prompt APIs hold company data:
+// require a signed-in user, and never trust a tenantId sent by the browser —
+// the route handlers scope every query to req.auth.tid. Must be registered
+// before those routes (below). self-check stays public for monitoring.
+const TENANT_API_PREFIXES = ['/api/safety', '/api/water', '/api/waste', '/api/attendance', '/api/ai/prompts'];
+app.use(TENANT_API_PREFIXES, (req, res, next) => {
+  if (req.originalUrl.split('?')[0] === '/api/safety/self-check') return next();
+  requireAuth(req, res, () => {
+    if (!req.auth || !req.auth.tid) return res.status(403).json({ success: false, error: 'No company selected for this account' });
+    if (req.query && 'tenantId' in req.query) req.query.tenantId = String(req.auth.tid);
+    if (req.body && typeof req.body === 'object' && 'tenantId' in req.body) req.body.tenantId = req.auth.tid;
+    next();
+  });
 });
 
 // ── Postgres safety routes: no SQL Server dependency, register immediately ──

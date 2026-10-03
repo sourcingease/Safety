@@ -103,10 +103,12 @@ function setupWaterManagementRoutes(app) {
   const p = getPool();
   const router = express.Router();
 
+  // Every route is scoped to the signed-in user's tenant (login is enforced by
+  // the /api/water middleware in web-server.js).
   for (const [, cfg] of Object.entries(MODULES)) {
     router.get(cfg.idPath, async (req, res) => {
       try {
-        const r = await p.query(`select * from ${cfg.table} order by created_at desc`);
+        const r = await p.query(`select * from ${cfg.table} where tenant_id = $1 order by created_at desc`, [req.auth.tid]);
         res.json({ success: true, data: r.rows, count: r.rows.length });
       } catch (error) {
         console.error(`Error fetching ${cfg.label} records:`, error);
@@ -116,7 +118,7 @@ function setupWaterManagementRoutes(app) {
 
     router.get(`${cfg.idPath}/:id`, async (req, res) => {
       try {
-        const r = await p.query(`select * from ${cfg.table} where id = $1`, [req.params.id]);
+        const r = await p.query(`select * from ${cfg.table} where id = $1 and tenant_id = $2`, [req.params.id, req.auth.tid]);
         if (r.rows.length === 0) return res.status(404).json({ success: false, error: `${cfg.label} not found` });
         res.json({ success: true, data: r.rows[0] });
       } catch (error) {
@@ -129,8 +131,8 @@ function setupWaterManagementRoutes(app) {
       try {
         const missing = cfg.required.filter((k) => !req.body[k]);
         if (missing.length) return res.status(400).json({ success: false, error: 'Missing required fields' });
-        const cols = ['created_by', ...cfg.fields.map(([, col]) => col)];
-        const vals = ['system', ...cfg.fields.map(([key, , kind]) => coerce(req.body[key], kind))];
+        const cols = ['tenant_id', 'created_by', ...cfg.fields.map(([, col]) => col)];
+        const vals = [req.auth.tid, 'system', ...cfg.fields.map(([key, , kind]) => coerce(req.body[key], kind))];
         const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
         const r = await p.query(`insert into ${cfg.table}(${cols.join(', ')}) values (${placeholders}) returning *`, vals);
         if (cfg.responseShape === 'row') {
@@ -148,9 +150,10 @@ function setupWaterManagementRoutes(app) {
       try {
         const missing = cfg.required.filter((k) => !req.body[k]);
         if (missing.length) return res.status(400).json({ success: false, error: 'Missing required fields' });
-        const assigns = cfg.fields.map(([, col], i) => `${col} = $${i + 2}`).join(', ');
-        const vals = [req.params.id, ...cfg.fields.map(([key, , kind]) => coerce(req.body[key], kind))];
-        await p.query(`update ${cfg.table} set ${assigns}, updated_by = 'system', updated_at = now() where id = $1`, vals);
+        const assigns = cfg.fields.map(([, col], i) => `${col} = $${i + 3}`).join(', ');
+        const vals = [req.params.id, req.auth.tid, ...cfg.fields.map(([key, , kind]) => coerce(req.body[key], kind))];
+        const r = await p.query(`update ${cfg.table} set ${assigns}, updated_by = 'system', updated_at = now() where id = $1 and tenant_id = $2`, vals);
+        if (!r.rowCount) return res.status(404).json({ success: false, error: `${cfg.label} not found` });
         res.json({ success: true, message: `${cfg.label} updated successfully`, id: req.params.id });
       } catch (error) {
         console.error(`Error updating ${cfg.label}:`, error);
@@ -160,7 +163,8 @@ function setupWaterManagementRoutes(app) {
 
     router.delete(`${cfg.idPath}/:id`, async (req, res) => {
       try {
-        await p.query(`delete from ${cfg.table} where id = $1`, [req.params.id]);
+        const r = await p.query(`delete from ${cfg.table} where id = $1 and tenant_id = $2`, [req.params.id, req.auth.tid]);
+        if (!r.rowCount) return res.status(404).json({ success: false, error: `${cfg.label} not found` });
         res.json({ success: true, message: `${cfg.label} deleted successfully` });
       } catch (error) {
         console.error(`Error deleting ${cfg.label}:`, error);

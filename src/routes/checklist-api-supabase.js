@@ -12,6 +12,7 @@ function getPool() {
   return pool;
 }
 
+// Headings/items are per tenant; login is enforced by the /api/safety middleware.
 function setupChecklistRoutes(app) {
   const p = getPool();
 
@@ -24,8 +25,8 @@ function setupChecklistRoutes(app) {
       const { tabId } = req.params;
       const r = await p.query(
         `select id, tab_id, heading_text, heading_slug, display_order, created_at
-         from safety_checklist_headings where tab_id = $1 order by display_order, id`,
-        [tabId]
+         from safety_checklist_headings where tab_id = $1 and tenant_id = $2 order by display_order, id`,
+        [tabId, req.auth.tid]
       );
       res.json(r.rows);
     } catch (err) {
@@ -39,9 +40,9 @@ function setupChecklistRoutes(app) {
       const { tabId, headingText, headingSlug, displayOrder } = req.body;
       if (!tabId || !headingText || !headingSlug) return res.status(400).json({ error: 'Missing required fields' });
       const r = await p.query(
-        `insert into safety_checklist_headings(tab_id, heading_text, heading_slug, display_order)
-         values ($1,$2,$3,$4) returning id`,
-        [tabId, headingText, headingSlug, displayOrder || 0]
+        `insert into safety_checklist_headings(tenant_id, tab_id, heading_text, heading_slug, display_order)
+         values ($1,$2,$3,$4,$5) returning id`,
+        [req.auth.tid, tabId, headingText, headingSlug, displayOrder || 0]
       );
       res.json({ success: true, id: r.rows[0].id, message: 'Heading created successfully' });
     } catch (err) {
@@ -53,7 +54,8 @@ function setupChecklistRoutes(app) {
 
   app.delete('/api/safety/checklist/headings/:id', async (req, res) => {
     try {
-      await p.query('delete from safety_checklist_headings where id = $1', [req.params.id]);
+      const r = await p.query('delete from safety_checklist_headings where id = $1 and tenant_id = $2', [req.params.id, req.auth.tid]);
+      if (!r.rowCount) return res.status(404).json({ error: 'Heading not found' });
       res.json({ success: true, message: 'Heading deleted successfully' });
     } catch (err) {
       console.error('Error deleting heading:', err);
@@ -66,8 +68,8 @@ function setupChecklistRoutes(app) {
       const { tabId } = req.params;
       const r = await p.query(
         `select id, tab_id, heading_text, heading_slug, item_text, options, display_order, created_at, is_active
-         from safety_checklist_items where tab_id = $1 and is_active = true order by heading_slug, display_order, id`,
-        [tabId]
+         from safety_checklist_items where tab_id = $1 and tenant_id = $2 and is_active = true order by heading_slug, display_order, id`,
+        [tabId, req.auth.tid]
       );
       res.json(r.rows);
     } catch (err) {
@@ -82,9 +84,9 @@ function setupChecklistRoutes(app) {
       if (!tabId || !headingText || !headingSlug || !itemText || !options) return res.status(400).json({ error: 'Missing required fields' });
       const optionsStr = Array.isArray(options) ? options.join(',') : options;
       const r = await p.query(
-        `insert into safety_checklist_items(tab_id, heading_text, heading_slug, item_text, options, display_order)
-         values ($1,$2,$3,$4,$5,$6) returning id`,
-        [tabId, headingText, headingSlug, itemText, optionsStr, displayOrder || 0]
+        `insert into safety_checklist_items(tenant_id, tab_id, heading_text, heading_slug, item_text, options, display_order)
+         values ($1,$2,$3,$4,$5,$6,$7) returning id`,
+        [req.auth.tid, tabId, headingText, headingSlug, itemText, optionsStr, displayOrder || 0]
       );
       res.json({ success: true, id: r.rows[0].id, message: 'Item created successfully' });
     } catch (err) {
@@ -95,7 +97,8 @@ function setupChecklistRoutes(app) {
 
   app.delete('/api/safety/checklist/items/:id', async (req, res) => {
     try {
-      await p.query('update safety_checklist_items set is_active = false, updated_at = now() where id = $1', [req.params.id]);
+      const r = await p.query('update safety_checklist_items set is_active = false, updated_at = now() where id = $1 and tenant_id = $2', [req.params.id, req.auth.tid]);
+      if (!r.rowCount) return res.status(404).json({ error: 'Item not found' });
       res.json({ success: true, message: 'Item deleted successfully' });
     } catch (err) {
       console.error('Error deleting item:', err);
