@@ -6034,6 +6034,7 @@ if (ENABLE_SUPABASE_SAFETY) {
   try { require('./routes/water-management-supabase').setupWaterManagementRoutes(app); } catch (e) { console.warn('Water Management API (Supabase) not loaded:', e.message); }
   try { require('./routes/waste-management-supabase').setupWasteManagementRoutes(app); } catch (e) { console.warn('Waste Management API (Supabase) not loaded:', e.message); }
   try { require('./routes/checklist-api-supabase').setupChecklistRoutes(app); } catch (e) { console.warn('Safety Checklist API (Supabase) not loaded:', e.message); }
+  try { require('./attendance/attendance-api').setupAttendanceRoutes(app, { hasPermission: supabaseAuth.hasPermission }); } catch (e) { console.warn('Face attendance API not loaded:', e.message); }
   try {
     const { setupChecklistSuggestionsRoutes } = require('./routes/checklist-suggestions');
     setupChecklistSuggestionsRoutes(app, null);

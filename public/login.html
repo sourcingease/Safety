@@ -384,7 +384,7 @@
 
           box.classList.add('ok');
           box.textContent = 'Signed in!';
-          const next = (payload && payload.redirect) ? payload.redirect : '/dashboard';
+          const next = requestedNext() || ((payload && payload.redirect) ? payload.redirect : '/dashboard');
           setTimeout(()=>{ window.location.href = next; }, 400);
         }else{
           twoFactorPending = false;
@@ -401,6 +401,15 @@
         box.classList.add('err');
         box.textContent = e.message;
       }
+    }
+
+    // ?next=/path sends the user back to the page that asked them to sign in.
+    // Only same-site paths are allowed (no "//host" or "https://…" open redirects).
+    function requestedNext(){
+      try{
+        const n = new URLSearchParams(location.search).get('next') || '';
+        return (n.startsWith('/') && !n.startsWith('//') && !n.startsWith('/\\')) ? n : null;
+      }catch(e){ return null; }
     }
 
     async function verifyCode(){
@@ -420,7 +429,7 @@
           console.log('verify-2fa success', data);
           box.classList.add('ok');
           box.textContent = 'Signed in!';
-          const next = (data && data.data && data.data.redirect) ? data.data.redirect : '/dashboard';
+          const next = requestedNext() || ((data && data.data && data.data.redirect) ? data.data.redirect : '/dashboard');
           // Use a direct navigation instead of a delayed redirect to avoid timing issues
           window.location.assign(next);
         }else{

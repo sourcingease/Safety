@@ -252,7 +252,8 @@
       </div>
       <div class="tab-panel" id="panel-attendance" style="display:none">
         <div style="font-weight:700;margin-bottom:6px">Attendance</div>
-        <p class="muted">This tab is reserved for employee attendance tracking. Layout and data wiring can be added here later.</p>
+        <p class="muted">Attendance has its own page: daily register, flagged check-ins, refused attempts, face enrollment and work-site rules.</p>
+        <a class="ct primary" href="/hr/attendance.html?embedded=1">Open Attendance</a>
       </div>
       <div class="tab-panel" id="panel-taxes" style="display:none">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
@@ -462,6 +463,7 @@
         const tabRaw = (url.searchParams.get('tab') || '');
         const tab = tabRaw.toLowerCase();
         const isEmbedded = url.searchParams.get('embedded') === '1';
+        if(tab === 'attendance'){ location.replace('/hr/attendance.html' + (isEmbedded ? '?embedded=1' : '')); return; }
         if(tab === 'totals' || tab === 'payroll' || tab === 'salary' || tab === 'paydetails' || tab === 'payroll-details' || tab === 'attendance' || tab === 'advance' || tab === 'advance-salary' || tab === 'taxes'){
           if(tab === 'salary'){
             showTab('payroll');

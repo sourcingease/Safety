@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HR &amp; Payroll • Attendance</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/app.css">
+  <style>
+    body{margin:0;font-family:Inter,Segoe UI,Arial;background:#f5f7fa;color:#0f172a}
+    .shell{max-width:1300px;margin:0 auto;padding:16px}
+    .card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;box-shadow:0 1px 3px rgba(15,23,42,.06);padding:16px;margin-bottom:12px}
+    .tabs{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid #e2e8f0;padding-bottom:8px;margin-bottom:12px}
+    .tabs button{border:0;background:transparent;padding:8px 12px;border-radius:999px;font-size:13px;cursor:pointer}
+    .tabs button.active{background:#0ea5e9;color:#fff}
+    .tabs .badge{display:inline-block;min-width:18px;padding:0 6px;border-radius:999px;background:#ef4444;color:#fff;font-size:11px;margin-left:4px}
+    .row{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:10px}
+    .muted{color:#64748b;font-size:12px}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid #e2e8f0;text-align:left;font-size:13px;vertical-align:top}
+    th{background:#f8fafc;text-transform:uppercase;font-size:11px;color:#475569}
+    .table-wrap{overflow-x:auto}
+    .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700}
+    .pill.ok{background:#dcfce7;color:#166534}.pill.bad{background:#fee2e2;color:#b91c1c}.pill.warn{background:#fef3c7;color:#92400e}.pill.off{background:#e5e7eb;color:#374151}
+    .stats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+    .stat{flex:1;min-width:130px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px}
+    .stat b{display:block;font-size:22px}
+    .alert{padding:10px 14px;border-radius:10px;margin-bottom:10px;font-size:13px}
+    .alert.warn{background:#fffbeb;border:1px solid #fde68a;color:#78350f}
+    .review{display:grid;grid-template-columns:auto auto 1fr;gap:12px;align-items:start;border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin-bottom:10px}
+    .review img{width:120px;height:120px;object-fit:cover;border-radius:10px;background:#e2e8f0}
+    .review .cap{font-size:11px;color:#64748b;text-align:center;margin-top:2px}
+    @media(max-width:720px){.review{grid-template-columns:1fr 1fr}.review .info{grid-column:1/-1}}
+    .thumb{width:44px;height:44px;object-fit:cover;border-radius:8px;background:#e2e8f0}
+    input,select,textarea{font:inherit}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+    .tab-panel{display:none}.tab-panel.active{display:block}
+  </style>
+</head>
+<body>
+  <script src="/js/master-layout.js"></script>
+  <script>
+    // Inside the app shell the parent provides the header
+    (function(){
+      function hideIfEmbedded(){ if(new URLSearchParams(location.search).get('embedded')==='1'){ const h=document.getElementById('hdr'); if(h) h.style.display='none'; } }
+      if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', hideIfEmbedded); else hideIfEmbedded();
+    })();
+  </script>
+  <div class="dashboard-header" id="hdr">
+    <div class="header-left"><img src="/logo.png" class="logo-small"><div class="dashboard-title">HR &amp; Payroll • Attendance</div></div>
+    <div class="header-right"></div>
+  </div>
+
+  <div class="shell">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+        <div>
+          <div style="font-weight:700;font-size:18px">Attendance</div>
+          <div class="muted">Face-verified check-ins with liveness, geofence and fraud flags.</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <a class="ct" href="/attendance/checkin.html" target="_blank">Open my check-in</a>
+          <a class="ct primary" href="/attendance/checkin.html?mode=kiosk" target="_blank">Open kiosk mode</a>
+        </div>
+      </div>
+      <div class="tabs" id="tabs">
+        <button data-tab="register" class="active">Daily register</button>
+        <button data-tab="review">Review <span class="badge" id="flagBadge" style="display:none"></span></button>
+        <button data-tab="refused">Refused attempts</button>
+        <button data-tab="enroll">Face enrollment</button>
+        <button data-tab="setup">Sites &amp; rules</button>
+      </div>
+      <div id="setupWarn"></div>
+
+      <!-- Register -->
+      <div class="tab-panel active" id="panel-register">
+        <div class="row">
+          <div class="form-group"><label class="form-label">Date</label><input type="date" id="regDate" class="form-input"/></div>
+          <button class="ct" onclick="loadRegister()">Refresh</button>
+        </div>
+        <div class="stats" id="regStats"></div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Employee</th><th>Status</th><th>First in</th><th>Last out</th><th>Entries</th><th>Face enrolled</th></tr></thead>
+          <tbody id="regRows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody>
+        </table></div>
+      </div>
+
+      <!-- Review -->
+      <div class="tab-panel" id="panel-review">
+        <div class="row">
+          <div class="form-group"><label class="form-label">Show</label>
+            <select id="revStatus" class="form-select" onchange="loadReview()">
+              <option value="flagged">Waiting for review</option><option value="approved">Approved</option><option value="rejected">Rejected</option>
+            </select></div>
+        </div>
+        <div id="revList" class="muted">Loading…</div>
+      </div>
+
+      <!-- Refused -->
+      <div class="tab-panel" id="panel-refused">
+        <div class="row">
+          <div class="form-group"><label class="form-label">Period</label>
+            <select id="refDays" class="form-select" onchange="loadRefused()">
+              <option value="1">Last 24 hours</option><option value="7" selected>Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option>
+            </select></div>
+        </div>
+        <div class="muted" style="margin-bottom:8px">Every check-in that was refused, with the reason. Repeated attempts for the same person, or faces matching a different employee, may indicate attempted false attendance.</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Photo</th><th>When</th><th>Mode</th><th>Signed-in user</th><th>Face matched</th><th>Reasons</th><th>Scores</th></tr></thead>
+          <tbody id="refRows"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+        </table></div>
+      </div>
+
+      <!-- Enrollment -->
+      <div class="tab-panel" id="panel-enroll">
+        <div class="muted" style="margin-bottom:8px">Enroll each employee in person. Enrollment opens in a new tab (the camera needs a full page). Only one employee can be enrolled per face.</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Photo</th><th>Employee</th><th>Email</th><th>Status</th><th></th></tr></thead>
+          <tbody id="enrRows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+        </table></div>
+      </div>
+
+      <!-- Setup -->
+      <div class="tab-panel" id="panel-setup">
+        <div style="font-weight:700;margin-bottom:6px">Work sites (geofence)</div>
+        <div class="muted" style="margin-bottom:8px">Check-ins must be made inside one of these circles. Stand at the site and use “Use my location” for accurate coordinates.</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Name</th><th>Latitude</th><th>Longitude</th><th>Radius (m)</th><th></th></tr></thead>
+          <tbody id="siteRows"></tbody>
+        </table></div>
+        <div class="grid" style="margin-top:8px;align-items:end">
+          <div class="form-group"><label class="form-label">Site name</label><input id="sName" class="form-input" placeholder="e.g. Main factory gate"/></div>
+          <div class="form-group"><label class="form-label">Latitude</label><input id="sLat" type="number" step="0.000001" class="form-input"/></div>
+          <div class="form-group"><label class="form-label">Longitude</label><input id="sLng" type="number" step="0.000001" class="form-input"/></div>
+          <div class="form-group"><label class="form-label">Radius (m)</label><input id="sRad" type="number" value="150" class="form-input"/></div>
+          <div style="display:flex;gap:8px"><button class="ct" type="button" onclick="useMyLocation()">Use my location</button><button class="ct primary" type="button" onclick="addSite()">Add site</button></div>
+        </div>
+
+        <div style="font-weight:700;margin:18px 0 6px">Rules</div>
+        <div class="grid">
+          <div class="form-group"><label class="form-label">Face match needed (0–1)</label><input id="stMatch" type="number" step="0.01" class="form-input"/><div class="muted">Below this the check-in is refused.</div></div>
+          <div class="form-group"><label class="form-label">Review below (0–1)</label><input id="stReview" type="number" step="0.01" class="form-input"/><div class="muted">Accepted matches below this are flagged.</div></div>
+          <div class="form-group"><label class="form-label">Liveness needed (0–1)</label><input id="stLive" type="number" step="0.01" class="form-input"/><div class="muted">Below: flagged. Below half: refused as spoof.</div></div>
+          <div class="form-group"><label class="form-label">Max GPS accuracy (m)</label><input id="stAcc" type="number" class="form-input"/><div class="muted">Worse accuracy is flagged.</div></div>
+          <div class="form-group"><label class="form-label">Minutes between check-ins</label><input id="stGap" type="number" class="form-input"/></div>
+          <div class="form-group"><label class="form-label">Keep photos (days)</label><input id="stKeep" type="number" class="form-input"/></div>
+          <div class="form-group"><label class="form-label">Geofence</label><div><input type="checkbox" id="stGeo"/> Refuse check-ins outside a site</div></div>
+        </div>
+        <div style="text-align:right;margin-top:10px"><button class="ct primary" type="button" onclick="saveSettings()">Save rules</button></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function api(url, opts){
+      const r = await fetch(url, Object.assign({ credentials:'include', headers:{'Content-Type':'application/json'} }, opts||{}));
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok || d.success===false) throw new Error(d.error || ('Request failed ('+r.status+')'));
+      return d;
+    }
+    const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const fmtTime = t => t ? new Date(t).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '—';
+    const fmtDateTime = t => t ? new Date(t).toLocaleString() : '';
+    const pct = v => v==null ? '—' : (Number(v)*100).toFixed(0)+'%';
+    const img = (src, cls) => src ? `<img class="${cls||'thumb'}" src="${esc(src)}" alt="">` : `<div class="${cls||'thumb'}"></div>`;
+    const mapLink = (lat,lng) => (lat!=null && lng!=null) ? `<a href="https://maps.google.com/?q=${lat},${lng}" target="_blank" rel="noopener">map</a>` : '';
+
+    // tabs
+    document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click', ()=>showTab(b.dataset.tab)));
+    function showTab(t){
+      document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===t));
+      document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active', p.id==='panel-'+t));
+      ({register:loadRegister, review:loadReview, refused:loadRefused, enroll:loadEnroll, setup:loadSetup})[t]();
+    }
+
+    // --- register ---
+    const today = () => { const d=new Date(); return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,10); };
+    document.getElementById('regDate').value = today();
+    document.getElementById('regDate').addEventListener('change', loadRegister);
+    async function loadRegister(){
+      const body = document.getElementById('regRows');
+      try{
+        const d = document.getElementById('regDate').value || today();
+        const r = await api('/api/attendance/register?date='+d+'&tzOffset='+new Date().getTimezoneOffset());
+        const rows = r.data||[];
+        const present = rows.filter(x=>x.Entries>0).length, flagged = rows.reduce((a,x)=>a+x.Flagged,0);
+        const notEnrolled = rows.filter(x=>!x.Enrolled).length;
+        document.getElementById('regStats').innerHTML =
+          `<div class="stat"><span class="muted">Present</span><b>${present}</b></div>`+
+          `<div class="stat"><span class="muted">Absent</span><b>${rows.length-present}</b></div>`+
+          `<div class="stat"><span class="muted">Flagged check-ins</span><b>${flagged}</b></div>`+
+          `<div class="stat"><span class="muted">Refused attempts</span><b>${r.summary.rejectedAttempts}</b></div>`+
+          `<div class="stat"><span class="muted">Not enrolled</span><b>${notEnrolled}</b></div>`;
+        document.getElementById('setupWarn').innerHTML = r.summary.sites ? '' :
+          '<div class="alert warn">⚠️ No work site is set up, so locations are not being checked. Add your site under <b>Sites &amp; rules</b>.</div>';
+        body.innerHTML = rows.length ? rows.map(x=>{
+          const status = x.Entries===0 ? '<span class="pill off">Absent</span>' : (x.Flagged ? `<span class="pill warn">Present • ${x.Flagged} to review</span>` : '<span class="pill ok">Present</span>');
+          return `<tr><td>${esc(x.FullName)}</td><td>${status}</td><td>${fmtTime(x.FirstIn)}</td><td>${fmtTime(x.LastOut)}</td><td>${x.Entries}</td><td>${x.Enrolled?'<span class="pill ok">Yes</span>':'<span class="pill bad">No</span>'}</td></tr>`;
+        }).join('') : '<tr><td colspan="6" class="muted">No employees.</td></tr>';
+        refreshFlagBadge();
+      }catch(e){ body.innerHTML = `<tr><td colspan="6" class="muted">${esc(e.message)}</td></tr>`; }
+    }
+
+    // --- review ---
+    async function refreshFlagBadge(){
+      try{ const r = await api('/api/attendance/review?status=flagged'); const b=document.getElementById('flagBadge'); b.textContent=r.data.length; b.style.display=r.data.length?'':'none'; }catch(e){}
+    }
+    async function loadReview(){
+      const box = document.getElementById('revList');
+      const status = document.getElementById('revStatus').value;
+      try{
+        const r = await api('/api/attendance/review?status='+status);
+        if(!r.data.length){ box.innerHTML = '<div class="muted">Nothing here.</div>'; return; }
+        box.innerHTML = r.data.map(x=>`
+          <div class="review">
+            <div>${img(x.Photo,'')}<div class="cap">Check-in photo</div></div>
+            <div>${img(x.EnrolledPhoto,'')}<div class="cap">Enrolled photo</div></div>
+            <div class="info">
+              <div style="font-weight:700">${esc(x.FullName)} — ${esc(x.Direction)} • ${fmtDateTime(x.Timestamp)}</div>
+              <div class="muted">${esc(x.Source||'')} ${x.SiteName?'• '+esc(x.SiteName):''} ${x.DistanceM!=null?'• '+Math.round(x.DistanceM)+' m from site':''} ${x.GpsAccuracy!=null?'• GPS ±'+Math.round(x.GpsAccuracy)+' m':''} ${mapLink(x.Latitude,x.Longitude)}</div>
+              <div style="margin:6px 0">${(x.FlagText||[]).map(f=>`<span class="pill warn" style="margin:0 4px 4px 0">${esc(f)}</span>`).join('')}</div>
+              <div class="muted">Face match ${pct(x.MatchScore)} • Liveness ${pct(x.LivenessScore)}</div>
+              ${status==='flagged' ? `
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:center">
+                  <input id="note_${x.Id}" class="form-input" style="flex:1;min-width:180px" placeholder="Note (required to reject)"/>
+                  <button class="ct primary" type="button" onclick="review(${x.Id},'approved')">Approve</button>
+                  <button class="ct" type="button" onclick="review(${x.Id},'rejected')">Reject</button>
+                </div>` : `<div class="muted" style="margin-top:6px">${esc(x.ReviewStatus)} by ${esc(x.ReviewedBy||'')} ${fmtDateTime(x.ReviewedAt)} ${x.ReviewNote?'— '+esc(x.ReviewNote):''}</div>`}
+            </div>
+          </div>`).join('');
+      }catch(e){ box.innerHTML = `<div class="muted">${esc(e.message)}</div>`; }
+    }
+    async function review(id, decision){
+      try{
+        await api('/api/attendance/logs/'+id+'/review', { method:'POST', body: JSON.stringify({ decision, note: (document.getElementById('note_'+id)||{}).value||'' }) });
+        loadReview(); refreshFlagBadge();
+      }catch(e){ alert(e.message); }
+    }
+
+    // --- refused ---
+    async function loadRefused(){
+      const body = document.getElementById('refRows');
+      try{
+        const r = await api('/api/attendance/rejected?days='+document.getElementById('refDays').value);
+        body.innerHTML = r.data.length ? r.data.map(x=>`<tr>
+          <td>${img(x.Photo)}</td><td>${fmtDateTime(x.CreatedAt)}</td><td>${esc(x.Mode)}</td>
+          <td>${esc(x.ClaimedName||(x.Mode==='kiosk'?'(kiosk) '+(x.RecordedBy||''):''))}</td><td>${esc(x.MatchedName||'—')}</td>
+          <td>${(x.ReasonText||[]).map(esc).join('<br/>')}</td>
+          <td class="muted">match ${pct(x.MatchScore)}<br/>liveness ${pct(x.LivenessScore)}<br/>${mapLink(x.Latitude,x.Longitude)}</td></tr>`).join('')
+          : '<tr><td colspan="7" class="muted">No refused attempts in this period.</td></tr>';
+      }catch(e){ body.innerHTML = `<tr><td colspan="7" class="muted">${esc(e.message)}</td></tr>`; }
+    }
+
+    // --- enrollment ---
+    async function loadEnroll(){
+      const body = document.getElementById('enrRows');
+      try{
+        const r = await api('/api/attendance/enrollments');
+        body.innerHTML = r.data.map(x=>`<tr>
+          <td>${img(x.Photo)}</td><td>${esc(x.FullName)}</td><td>${esc(x.Email)}</td>
+          <td>${x.Enrolled?`<span class="pill ok">Enrolled</span><div class="muted">${fmtDateTime(x.EnrolledAt)}</div>`:'<span class="pill bad">Not enrolled</span>'}</td>
+          <td style="white-space:nowrap">
+            <a class="ct primary" target="_blank" href="/attendance/enroll.html?userId=${x.UserId}&name=${encodeURIComponent(x.FullName||'')}">${x.Enrolled?'Re-enroll':'Enroll'}</a>
+            ${x.Enrolled?`<button class="ct" type="button" onclick="removeEnroll(${x.UserId})">Remove</button>`:''}
+          </td></tr>`).join('');
+      }catch(e){ body.innerHTML = `<tr><td colspan="5" class="muted">${esc(e.message)}</td></tr>`; }
+    }
+    async function removeEnroll(userId){
+      if(!confirm('Remove this employee\'s face enrollment? They will not be able to check in until re-enrolled.')) return;
+      try{ await api('/api/attendance/enrollments/'+userId, { method:'DELETE' }); loadEnroll(); }catch(e){ alert(e.message); }
+    }
+    window.addEventListener('message', ev => { if(ev.origin===location.origin && ev.data && ev.data.type==='face-enrolled') loadEnroll(); });
+
+    // --- sites & rules ---
+    async function loadSetup(){
+      try{
+        const r = await api('/api/attendance/settings');
+        const s = r.data.settings;
+        document.getElementById('siteRows').innerHTML = r.data.sites.length ? r.data.sites.map(x=>`<tr>
+          <td>${esc(x.name)}</td><td>${Number(x.latitude).toFixed(6)}</td><td>${Number(x.longitude).toFixed(6)}</td><td>${x.radius_m}</td>
+          <td>${mapLink(x.latitude,x.longitude)} <button class="ct" type="button" onclick="deleteSite(${x.id})">Delete</button></td></tr>`).join('')
+          : '<tr><td colspan="5" class="muted">No sites yet.</td></tr>';
+        const set=(id,v)=>{ document.getElementById(id).value=v; };
+        set('stMatch', s.match_threshold); set('stReview', s.review_threshold); set('stLive', s.liveness_threshold);
+        set('stAcc', s.max_gps_accuracy_m); set('stGap', s.min_minutes_between); set('stKeep', s.photo_retention_days);
+        document.getElementById('stGeo').checked = !!s.require_geofence;
+      }catch(e){ document.getElementById('siteRows').innerHTML = `<tr><td colspan="5" class="muted">${esc(e.message)}</td></tr>`; }
+    }
+    function useMyLocation(){
+      if(!navigator.geolocation){ alert('Location is not available in this browser'); return; }
+      navigator.geolocation.getCurrentPosition(p=>{
+        document.getElementById('sLat').value = p.coords.latitude.toFixed(6);
+        document.getElementById('sLng').value = p.coords.longitude.toFixed(6);
+        if(p.coords.accuracy>50) alert('GPS accuracy is ±'+Math.round(p.coords.accuracy)+' m. For a better fix, try again outdoors or on a phone.');
+      }, e=>alert(e.code===1?'Location permission denied':'Could not get location'), { enableHighAccuracy:true, timeout:15000, maximumAge:0 });
+    }
+    async function addSite(){
+      const v=id=>document.getElementById(id).value;
+      try{
+        await api('/api/attendance/sites', { method:'POST', body: JSON.stringify({ name:v('sName'), latitude:v('sLat'), longitude:v('sLng'), radiusM:v('sRad') }) });
+        ['sName','sLat','sLng'].forEach(id=>document.getElementById(id).value='');
+        loadSetup();
+      }catch(e){ alert(e.message); }
+    }
+    async function deleteSite(id){
+      if(!confirm('Delete this site?')) return;
+      try{ await api('/api/attendance/sites/'+id, { method:'DELETE' }); loadSetup(); }catch(e){ alert(e.message); }
+    }
+    async function saveSettings(){
+      const n=id=>Number(document.getElementById(id).value);
+      try{
+        await api('/api/attendance/settings', { method:'PUT', body: JSON.stringify({
+          matchThreshold:n('stMatch'), reviewThreshold:n('stReview'), livenessThreshold:n('stLive'), maxGpsAccuracyM:n('stAcc'),
+          minMinutesBetween:n('stGap'), photoRetentionDays:n('stKeep'), requireGeofence: document.getElementById('stGeo').checked }) });
+        alert('Rules saved');
+      }catch(e){ alert(e.message); }
+    }
+
+    loadRegister();
+  </script>
+</body>
+</html>

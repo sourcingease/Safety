@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Enroll Face • ComplytEX</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+  <link rel="stylesheet" href="/app.css" />
+  <style>
+    :root{--accent:#0ea5e9;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Inter,Segoe UI,system-ui,Arial;background:#f5f7fa;color:var(--ink)}
+    .top{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:#fff;border-bottom:3px solid var(--accent)}
+    .top img{max-height:34px;width:auto}
+    .wrap{max-width:620px;margin:0 auto;padding:16px}
+    h1{font-size:20px;margin:6px 0 2px}
+    .sub{color:var(--muted);font-size:13px;margin-bottom:12px}
+    .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:12px}
+    .stage{position:relative;width:100%;aspect-ratio:4/3;background:#0f172a;border-radius:14px;overflow:hidden}
+    video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+    .oval{position:absolute;left:50%;top:48%;width:46%;height:76%;transform:translate(-50%,-50%);border:4px dashed rgba(255,255,255,.75);border-radius:50%;pointer-events:none}
+    .prompt{position:absolute;left:0;right:0;bottom:0;padding:12px;background:linear-gradient(transparent,rgba(15,23,42,.85));color:#fff;text-align:center;font-weight:700}
+    .thumbs{display:flex;gap:8px;margin-top:10px;min-height:10px}
+    .thumbs img{width:31%;border-radius:8px;transform:scaleX(-1)}
+    .consent{display:flex;gap:10px;align-items:flex-start;font-size:13px;line-height:1.5}
+    .consent input{margin-top:4px;width:18px;height:18px}
+    .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+    .btn{flex:1;padding:14px;border:0;border-radius:12px;background:var(--accent);color:#fff;font-size:16px;font-weight:700;cursor:pointer}
+    .btn.sec{background:#f1f5f9;color:#334155;border:1px solid var(--line)}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .msg{margin-top:12px;padding:12px 14px;border-radius:12px;display:none;font-size:14px}
+    .msg.ok{display:block;background:#f0fdf4;border:1px solid #bbf7d0;color:#14532d}
+    .msg.bad{display:block;background:#fef2f2;border:1px solid #fecaca;color:#7f1d1d}
+  </style>
+</head>
+<body>
+  <div class="top"><img src="/logo.png" alt="ComplytEX" /><span class="sub" style="margin:0">HR • Face enrollment</span></div>
+  <div class="wrap">
+    <h1>Enroll face: <span id="empName">employee</span></h1>
+    <div class="sub">Enrollment must be done in person by HR. The employee looks straight at the camera; three photos are taken.</div>
+
+    <div class="card">
+      <label class="consent">
+        <input type="checkbox" id="consent" />
+        <span>The employee has been told, and agrees, that their face will be used to verify attendance; that a face template (not the photo) is used for matching; that check-in photos are kept for review and deleted after the retention period; and that they can ask HR to remove their enrollment. Consent is recorded under your name.</span>
+      </label>
+    </div>
+
+    <div class="stage">
+      <video id="video" autoplay muted playsinline></video>
+      <div class="oval"></div>
+      <div class="prompt" id="prompt">Tap “Start camera”</div>
+    </div>
+    <div class="thumbs" id="thumbs"></div>
+
+    <div class="btns">
+      <button class="btn sec" id="camBtn">Start camera</button>
+      <button class="btn" id="enrollBtn" disabled>Take photos &amp; enroll</button>
+    </div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <script src="/js/face-camera.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const userId = parseInt(params.get('userId'), 10);
+    const $ = (id) => document.getElementById(id);
+    const video = $('video');
+    $('empName').textContent = params.get('name') || ('#' + userId);
+    let cameraOn = false;
+
+    function msg(kind, text) { const m = $('msg'); m.className = 'msg ' + kind; m.textContent = text; }
+    function updateButtons() { $('enrollBtn').disabled = !(cameraOn && $('consent').checked && userId); }
+    $('consent').addEventListener('change', updateButtons);
+
+    $('camBtn').addEventListener('click', async () => {
+      try {
+        await FaceCam.start(video); cameraOn = true;
+        $('prompt').textContent = 'Face in the oval, look straight at the camera';
+        $('camBtn').disabled = true; updateButtons();
+      } catch (e) { msg('bad', e.message); }
+    });
+
+    $('enrollBtn').addEventListener('click', async () => {
+      $('enrollBtn').disabled = true; $('thumbs').innerHTML = ''; $('msg').className = 'msg';
+      try {
+        const frames = [];
+        for (let i = 1; i <= 3; i++) {
+          $('prompt').textContent = `Hold still… photo ${i} of 3`;
+          await FaceCam.sleep(900);
+          const f = FaceCam.capture(video, 480, 0.9);
+          frames.push(f);
+          const img = document.createElement('img'); img.src = f; $('thumbs').appendChild(img);
+        }
+        $('prompt').textContent = 'Checking photos…';
+        await FaceCam.api('/api/attendance/enrollments', { method: 'POST', body: JSON.stringify({ userId, consent: true, frames }) });
+        $('prompt').textContent = 'Enrolled ✅';
+        msg('ok', 'Face enrolled. The employee can now check in. You can close this tab.');
+        if (window.opener) { try { window.opener.postMessage({ type: 'face-enrolled', userId }, location.origin); } catch (e) {} }
+      } catch (e) {
+        $('prompt').textContent = 'Try again';
+        msg('bad', e.message);
+        updateButtons();
+      }
+    });
+
+    if (!userId) msg('bad', 'No employee selected. Open this page from HR > Attendance > Face enrollment.');
+    window.addEventListener('pagehide', () => FaceCam.stop(video));
+  </script>
+</body>
+</html>

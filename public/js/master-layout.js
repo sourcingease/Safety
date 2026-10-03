@@ -673,7 +673,7 @@ window.renderMasterHeader = function(opts){
             ['addemp','➕','Add New Employee','/hr/index.html'],
             // These three live as tabs inside /hr/index.html (there are no separate pages)
             ['gensalary','💵','Generate Salary','/hr/index.html?tab=payroll'],
-            ['attendance','🕒','Attendance','/hr/index.html?tab=attendance'],
+            ['attendance','🕒','Attendance','/hr/attendance.html'],
             ['advance','💳','Advance Salary','/hr/index.html?tab=advance-salary'],
             ['taxes','🧾','Taxes','/hr/index.html?tab=taxes']
           ];
@@ -968,10 +968,7 @@ window.renderMasterHeader = function(opts){
           // button since the shell controls the tab selection via ?tab=payroll.
           openHrUrl('/hr/index.html?tab=payroll&embedded=1');
         } else if(action === 'attendance'){
-          // Open Attendance view within HR workspace (placeholder for now)
-          if(!clickByText('attendance')){
-            openHrUrl('/hr/index.html?tab=attendance&embedded=1');
-          }
+          openHrUrl('/hr/attendance.html?embedded=1');
         } else if(action === 'advance'){
           // Open Advance Salary view within HR workspace (placeholder for now)
           if(!clickByText('advance salary')){
@@ -1106,6 +1103,8 @@ window.renderMasterHeader = function(opts){
       item('#','💬','Chat','Chat', openChatInPlace),
       item('#','📊','Report','Report', openReportInPlace),
       item('#','📍','Tracking','Tracking', openTrackingInPlace),
+      // Face check-in needs the camera, which embedded frames can't use: open a full page
+      item('/attendance/checkin.html','🕘','Attendance check-in','Check-in', function(){ window.open('/attendance/checkin.html', '_blank'); }),
       item('#','⚙️','Setup','Setup', openSetupInPlace)
     );
     right.prepend(icons);

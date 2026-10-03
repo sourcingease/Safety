@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Attendance Check-in • ComplytEX</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+  <link rel="stylesheet" href="/app.css" />
+  <style>
+    :root{--accent:#0ea5e9;--ok:#16a34a;--bad:#dc2626;--warn:#d97706;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Inter,Segoe UI,system-ui,Arial;background:#f5f7fa;color:var(--ink)}
+    .top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#fff;border-bottom:3px solid var(--accent)}
+    .top img{max-height:34px;width:auto}
+    .top a{font-size:13px;color:#0284c7;text-decoration:none}
+    .wrap{max-width:560px;margin:0 auto;padding:16px}
+    h1{font-size:20px;margin:6px 0 2px}
+    .sub{color:var(--muted);font-size:13px;margin-bottom:12px}
+    .stage{position:relative;width:100%;aspect-ratio:3/4;max-height:62vh;background:#0f172a;border-radius:18px;overflow:hidden}
+    video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)} /* mirrored preview only */
+    .oval{position:absolute;left:50%;top:46%;width:62%;height:68%;transform:translate(-50%,-50%);border:4px dashed rgba(255,255,255,.7);border-radius:50%;pointer-events:none;transition:border-color .2s}
+    .oval.active{border-color:#38bdf8;border-style:solid}
+    .prompt{position:absolute;left:0;right:0;bottom:0;padding:14px;background:linear-gradient(transparent,rgba(15,23,42,.85));color:#fff;text-align:center;font-weight:700;font-size:20px;min-height:64px}
+    .prompt .arrow{font-size:34px;display:block;line-height:1.1}
+    .chips{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+    .chip{font-size:12px;padding:5px 10px;border-radius:999px;background:#fff;border:1px solid var(--line);color:var(--muted)}
+    .chip.ok{border-color:#bbf7d0;background:#f0fdf4;color:#166534}
+    .chip.bad{border-color:#fecaca;background:#fef2f2;color:#991b1b}
+    .btn{display:block;width:100%;padding:16px;border:0;border-radius:14px;background:var(--accent);color:#fff;font-size:18px;font-weight:700;cursor:pointer}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .result{margin-top:12px;padding:14px 16px;border-radius:14px;display:none}
+    .result.ok{display:block;background:#f0fdf4;border:1px solid #bbf7d0;color:#14532d}
+    .result.warn{display:block;background:#fffbeb;border:1px solid #fde68a;color:#78350f}
+    .result.bad{display:block;background:#fef2f2;border:1px solid #fecaca;color:#7f1d1d}
+    .result .big{font-size:22px;font-weight:800}
+    .note{font-size:12px;color:var(--muted);margin-top:14px;line-height:1.5}
+    body.kiosk .wrap{max-width:720px}
+    body.kiosk .top a{display:none}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <img src="/logo.png" alt="ComplytEX" />
+    <a href="/dashboard" target="_top">← Back to app</a>
+  </div>
+  <div class="wrap">
+    <h1 id="title">Attendance check-in</h1>
+    <div class="sub" id="sub">Check in or out with your face. Your location is checked against your work site.</div>
+
+    <div class="stage">
+      <video id="video" autoplay muted playsinline></video>
+      <div class="oval" id="oval"></div>
+      <div class="prompt" id="prompt">Tap “Start” to turn on the camera</div>
+    </div>
+
+    <div class="chips">
+      <span class="chip" id="camChip">📷 Camera: off</span>
+      <span class="chip" id="locChip">📍 Location: not checked</span>
+      <span class="chip" id="lastChip" style="display:none"></span>
+    </div>
+
+    <button class="btn" id="startBtn">Start</button>
+    <div class="result" id="result"></div>
+
+    <div class="note">
+      For your security: a live head-turn is required, photos and screens are rejected, and every attempt (including refused ones) is recorded with a photo for HR. Only one person may be in front of the camera.
+    </div>
+  </div>
+
+  <script src="/js/face-camera.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const MODE = params.get('mode') === 'kiosk' ? 'kiosk' : 'self';
+    const $ = (id) => document.getElementById(id);
+    const video = $('video');
+    let cameraOn = false, busy = false, me = null;
+
+    if (MODE === 'kiosk') {
+      document.body.classList.add('kiosk');
+      $('title').textContent = 'Attendance kiosk';
+      $('sub').textContent = 'Stand in front of the camera and follow the instructions. You will be recognised by your face.';
+    }
+
+    function chip(el, text, state) { el.textContent = text; el.className = 'chip' + (state ? ' ' + state : ''); }
+    function prompt(text, arrow) {
+      $('prompt').innerHTML = (arrow ? '<span class="arrow">' + arrow + '</span>' : '') + text;
+    }
+    function showResult(kind, html) { const r = $('result'); r.className = 'result ' + kind; r.innerHTML = html; }
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+    async function loadMe() {
+      me = (await FaceCam.api('/api/attendance/me')).data;
+      if (MODE === 'kiosk' && !me.kiosk) {
+        showResult('bad', 'This account is not allowed to run the attendance kiosk. Sign in with a kiosk or HR account.');
+        $('startBtn').disabled = true; return;
+      }
+      if (MODE === 'self') {
+        if (!me.enrolled) {
+          showResult('warn', '<b>Your face is not enrolled yet.</b><br/>Ask HR to enroll you before you can check in.');
+          $('startBtn').disabled = true;
+        }
+        if (me.last) {
+          const t = new Date(me.last.timestamp);
+          $('lastChip').style.display = '';
+          chip($('lastChip'), '🕘 Last: ' + me.last.direction + ' ' + t.toLocaleString());
+        }
+      }
+    }
+
+    async function startCamera() {
+      await FaceCam.start(video);
+      cameraOn = true;
+      chip($('camChip'), '📷 Camera: on', 'ok');
+      prompt(MODE === 'kiosk' ? 'Step in front of the camera, then tap “Check in / out”' : 'Position your face in the oval');
+      $('startBtn').textContent = 'Check in / out';
+    }
+
+    async function runCheckin() {
+      busy = true; $('startBtn').disabled = true; $('result').className = 'result';
+      try {
+        // location first (in parallel with the challenge)
+        chip($('locChip'), '📍 Location: checking…');
+        const locP = FaceCam.location().then((loc) => {
+          chip($('locChip'), '📍 Location: ±' + Math.round(loc.accuracy) + ' m', loc.accuracy > 100 ? 'bad' : 'ok'); return loc;
+        }).catch((e) => { chip($('locChip'), '📍 ' + e.message, 'bad'); return null; });
+        const ch = (await FaceCam.api('/api/attendance/challenge', { method: 'POST', body: JSON.stringify({ mode: MODE }) })).data;
+        const left = ch.action === 'turn_left';
+        $('oval').classList.add('active');
+        const frames = [];
+        prompt('Look straight at the camera'); await FaceCam.sleep(1300); frames.push(FaceCam.capture(video));
+        // The preview is mirrored, so the person's left is on the left of the screen
+        prompt(left ? 'Slowly turn your head to your LEFT' : 'Slowly turn your head to your RIGHT', left ? '⬅' : '➡');
+        await FaceCam.sleep(1300); frames.push(FaceCam.capture(video));
+        await FaceCam.sleep(600); frames.push(FaceCam.capture(video));
+        prompt('Now look straight again'); await FaceCam.sleep(1300); frames.push(FaceCam.capture(video));
+        $('oval').classList.remove('active');
+        prompt('Checking…');
+        const location = await locP;
+        const res = (await FaceCam.api('/api/attendance/face-checkin', {
+          method: 'POST', body: JSON.stringify({ challengeId: ch.challengeId, frames, location, deviceId: FaceCam.deviceId() }),
+        })).data;
+        const when = new Date(res.time).toLocaleTimeString();
+        const who = MODE === 'kiosk' ? esc(res.employeeName) + ' — ' : '';
+        if (res.flagged) {
+          showResult('warn', `<div class="big">✔ ${who}Checked ${res.direction === 'In' ? 'IN' : 'OUT'} at ${when}</div>Recorded, but sent to HR for review: ${res.flags.map(esc).join('; ')}.`);
+        } else {
+          showResult('ok', `<div class="big">✔ ${who}Checked ${res.direction === 'In' ? 'IN' : 'OUT'} at ${when}</div>${res.site ? 'Site: ' + esc(res.site) : ''}`);
+        }
+        prompt(res.direction === 'In' ? 'Welcome! ✅' : 'Goodbye! ✅');
+        if (MODE === 'self') { $('lastChip').style.display = ''; chip($('lastChip'), '🕘 Last: ' + res.direction + ' ' + new Date(res.time).toLocaleString()); }
+      } catch (e) {
+        $('oval').classList.remove('active');
+        showResult('bad', '<div class="big">✖ Not recorded</div>' + esc(e.message));
+        prompt('Try again');
+      } finally {
+        busy = false; $('startBtn').disabled = false;
+        if (MODE === 'kiosk') setTimeout(() => { if (!busy) { $('result').className = 'result'; prompt('Step in front of the camera, then tap “Check in / out”'); } }, 6000);
+      }
+    }
+
+    $('startBtn').addEventListener('click', async () => {
+      if (busy) return;
+      try {
+        if (!cameraOn) { await startCamera(); return; } // first tap only turns the camera on
+        await runCheckin();
+      } catch (e) { showResult('bad', esc(e.message)); }
+    });
+
+    loadMe().catch((e) => showResult('bad', esc(e.message)));
+    window.addEventListener('pagehide', () => FaceCam.stop(video));
+  </script>
+</body>
+</html>
