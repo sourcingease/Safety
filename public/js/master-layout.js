@@ -1122,7 +1122,20 @@ window.renderMasterHeader = function(opts){
     document.addEventListener('click', (e)=>{ if(!menu.contains(e.target) && !badge.contains(e.target)) menu.classList.remove('open'); });
     const so = document.getElementById('mlSignOut'); if(so){ so.onclick = function(){ fetch('/api/auth/logout',{method:'POST',credentials:'include'}).finally(()=>{ location.href='/login';}); }; }
     // Replace the placeholder identity with the signed-in user
-    fetch('/api/auth/me',{credentials:'include'}).then(r=>r.ok?r.json():null).then(function(j){
+    fetch('/api/auth/me',{credentials:'include'}).then(function(r){
+      // Signed out (cookie expired/cleared): go to login and come back here,
+      // instead of leaving a half-working page. Public pages are exempt.
+      if(r.status === 401){
+        var publicPages = ['/hr/apply.html', '/login', '/login.html', '/register', '/register.html', '/'];
+        var top = window.top || window;
+        var here = top.location.pathname;
+        if(publicPages.indexOf(here) === -1){
+          top.location.href = '/login?next=' + encodeURIComponent(here + top.location.search);
+        }
+        return null;
+      }
+      return r.ok ? r.json() : null;
+    }).then(function(j){
       const u = j && j.data && j.data.user; if(!u) return;
       const name = u.FullName || u.Email || '';
       const initials = name.split(/[\s@._-]+/).filter(Boolean).slice(0,2).map(function(w){ return w[0].toUpperCase(); }).join('') || '?';

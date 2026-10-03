@@ -107,6 +107,9 @@ function verifyToken(token) {
   const secret = process.env.JWT_SECRET || 'dev_secret_change_me';
   return jwt.verify(token, secret, { algorithms: ['HS256'] });
 }
+// Login cookie lives as long as the token (7d), so closing the browser doesn't
+// sign people out; HTTPS-only in production.
+const AUTH_COOKIE_OPTS = { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 3600 * 1000 };
 
 // Auth middleware
 function requireAuth(req, res, next) {
@@ -736,7 +739,7 @@ app.get('/api/auth/session', (req, res) => {
 
 // Logout
 app.post('/api/auth/logout', (req, res) => {
-  res.clearCookie('auth');
+  res.clearCookie('auth', { httpOnly: true, sameSite: 'lax', secure: AUTH_COOKIE_OPTS.secure });
   res.json({ success: true });
 });
 
@@ -1075,7 +1078,7 @@ app.post('/api/auth/switch-tenant', requireAuth, async (req, res) => {
       if (r.recordset.length === 0) return res.status(403).json({ success: false, error: 'forbidden' });
     }
     const token = signToken({ uid: req.auth.uid, tid: parseInt(tenantId) });
-    res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+    res.cookie('auth', token, AUTH_COOKIE_OPTS);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
@@ -1218,7 +1221,7 @@ app.post('/api/auth/login', async (req, res) => {
       const tenants = await supabaseAuth.getUserTenants(user.UserId);
       const firstTenantId = tenants[0]?.TenantId || null;
       const token = signToken({ uid: user.UserId, tid: firstTenantId });
-      res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+      res.cookie('auth', token, AUTH_COOKIE_OPTS);
 
       let redirect = '/dashboard';
       try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
@@ -1367,7 +1370,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     const firstTenantId = tenants.recordset[0]?.TenantId || null;
     const token = signToken({ uid: user.UserId, tid: firstTenantId });
-    res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+    res.cookie('auth', token, AUTH_COOKIE_OPTS);
 
     let redirect = '/dashboard';
     try { redirect = await determineRedirect(new AzureSQLConnector(), user.UserId, firstTenantId); } catch {}
@@ -1396,7 +1399,7 @@ app.post('/api/auth/verify-2fa', async (req, res) => {
         const tenants = await supabaseAuth.getUserTenants(user.UserId);
         const firstTenantId = tenants[0]?.TenantId || null;
         const token = signToken({ uid: user.UserId, tid: firstTenantId });
-        res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+        res.cookie('auth', token, AUTH_COOKIE_OPTS);
         let redirect = '/dashboard';
         try { redirect = await determineRedirect(null, user.UserId, firstTenantId); } catch {}
         return res.json({ success: true, data: { userId: user.UserId, email: user.Email, fullName: user.FullName, tenants, tenantId: firstTenantId, redirect } });
@@ -1502,7 +1505,7 @@ app.post('/api/auth/verify-2fa', async (req, res) => {
 
           const firstTenantId = tenants.recordset[0]?.TenantId || null;
           const token = signToken({ uid: user.UserId, tid: firstTenantId });
-          res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+          res.cookie('auth', token, AUTH_COOKIE_OPTS);
 
           let redirect = '/dashboard';
           try { redirect = await determineRedirect(new AzureSQLConnector(), user.UserId, firstTenantId); } catch {}
@@ -1557,7 +1560,7 @@ app.post('/api/auth/verify-2fa', async (req, res) => {
 
       const firstTenantId = tenants.recordset[0]?.TenantId || null;
       const token = signToken({ uid: user.UserId, tid: firstTenantId });
-      res.cookie('auth', token, { httpOnly: true, sameSite: 'lax' });
+      res.cookie('auth', token, AUTH_COOKIE_OPTS);
 
       let redirect = '/dashboard';
       try { redirect = await determineRedirect(new AzureSQLConnector(), user.UserId, firstTenantId); } catch {}
